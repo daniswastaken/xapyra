@@ -45,10 +45,9 @@ static bool green_led_state = false;
 static unsigned long last_wifi_check = 0;
 
 // === HIGH-PASS FILTER (vocal focus, cut below 200Hz) ===
+// === HIGH-PASS FILTER (vocal focus, cut below 200Hz) ===
 static float hp_x_prev = 0.0f;
 static float hp_y_prev = 0.0f;
-// Alpha for 1st-order IIR high-pass: fc=200Hz, fs=32kHz
-// alpha = exp(-2*pi*fc/fs) ≈ 0.9622
 #define HP_ALPHA 0.9622f
 
 static inline int16_t highpass_filter(int16_t sample) {
@@ -57,6 +56,55 @@ static inline int16_t highpass_filter(int16_t sample) {
     hp_x_prev = x;
     hp_y_prev = y;
     return (int16_t)y;
+}
+
+// === LOW-PASS FILTER (cut above 4kHz for vocal isolation) ===
+static float lp_x_prev = 0.0f;
+static float lp_y_prev = 0.0f;
+// fc=4000Hz, fs=32kHz → alpha = exp(-2*pi*fc/fs) ≈ 0.7788
+#define LP_ALPHA 0.7788f
+
+static inline int16_t lowpass_filter(int16_t sample) {
+    float x = (float)sample;
+    float y = LP_ALPHA * lp_y_prev + (1.0f - LP_ALPHA) * x;
+    lp_x_prev = x;
+    lp_y_prev = y;
+    return (int16_t)y;
+}
+
+// === AGC (Automatic Gain Control) ===
+static float agc_peak = 1.0f;
+static float agc_gain = 1.0f;
+#define AGC_TARGET    20000.0f   // target peak level (~-6dB)
+#define AGC_ATTACK    0.1f      // fast attack (gain down)
+#define AGC_RELEASE   0.001f    // slow release (gain up)
+#define AGC_MAX_GAIN  8.0f
+#define AGC_MIN_GAIN  0.1f
+
+static inline int16_t agc_process(int16_t sample) {
+    float abs_sample = fabsf((float)sample);
+
+    // Update peak with decay (leaky peak detector)
+    if (abs_sample > agc_peak) {
+        agc_peak = abs_sample;  // instant attack
+    } else {
+        agc_peak = agc_peak * 0.9999f;  // slow decay
+    }
+    if (agc_peak < 1.0f) agc_peak = 1.0f;
+
+    // Calculate desired gain
+    float desired_gain = AGC_TARGET / agc_peak;
+    if (desired_gain > AGC_MAX_GAIN) desired_gain = AGC_MAX_GAIN;
+    if (desired_gain < AGC_MIN_GAIN) desired_gain = AGC_MIN_GAIN;
+
+    // Smooth gain change (fast attack, slow release)
+    float alpha = (desired_gain < agc_gain) ? AGC_ATTACK : AGC_RELEASE;
+    agc_gain = agc_gain + alpha * (desired_gain - agc_gain);
+
+    float output = (float)sample * agc_gain;
+    if (output > 32767.0f) output = 32767.0f;
+    if (output < -32767.0f) output = -32767.0f;
+    return (int16_t)output;
 }
 
 // === LED STATE MACHINE (Core 0 only, non-blocking) ===
@@ -124,8 +172,8 @@ static void i2s_adc_init() {
 
 // === SAMPLE RATE (hardcoded, calibration causes watchdog reset) ===
 static void calibrate_sample_rate() {
-    actual_sample_rate = 16000;
-    Serial.printf("Sample rate: %u Hz (hardcoded)\n", actual_sample_rate);
+    actual_sample_rate = TARGET_SAMPLE_RATE;
+    Serial.printf("Sample rate: %u Hz\n", actual_sample_rate);
 }
 
 // === SHINE MP3 ENCODER ===
@@ -173,8 +221,13 @@ static void audio_encode_task(void *param) {
         for (int i = 0; i < samples_in_chunk; i++) {
             uint16_t raw_adc = (dma_buf[i] >> 4) & 0x0FFF;
             int16_t zero_centered = (int16_t)raw_adc - 2048;
-            int16_t filtered = highpass_filter(zero_centered << 4);
-            pcm_frame[pcm_pos++] = filtered;
+            int16_t sample = zero_centered << 4;
+
+            // Audio pipeline: HP → LP → AGC → encode
+            sample = highpass_filter(sample);
+            sample = lowpass_filter(sample);
+            sample = agc_process(sample);
+            pcm_frame[pcm_pos++] = sample;
 
             if (pcm_pos >= samples_per_pass) {
                 int written = 0;
