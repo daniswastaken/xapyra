@@ -1,0 +1,10 @@
+{
+  "name": "shine",
+  "version": "1.0.0",
+  "description": "Shine fixed-point MP3 encoder for ESP32",
+  "keywords": "mp3, encoder, shine, audio",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "headers": "layer3.h",
+  "srcFilter": "+<*.c>"
+}
