@@ -20,11 +20,11 @@ extern "C" {
 
 #define I2S_PORT        I2S_NUM_0
 #define ADC_CHANNEL     ADC1_CHANNEL_7
-#define TARGET_SAMPLE_RATE 16000
+#define TARGET_SAMPLE_RATE 32000
 #define DMA_BUF_COUNT   8
 #define DMA_BUF_LEN     512
 
-#define RING_BUF_SIZE   (16 * 1024)
+#define RING_BUF_SIZE   (32 * 1024)
 #define LED_FLICKER_MS  100
 #define WIFI_CHECK_MS   2000
 
@@ -43,6 +43,21 @@ static uint32_t frames_dropped = 0;
 static unsigned long last_led_toggle = 0;
 static bool green_led_state = false;
 static unsigned long last_wifi_check = 0;
+
+// === HIGH-PASS FILTER (vocal focus, cut below 200Hz) ===
+static float hp_x_prev = 0.0f;
+static float hp_y_prev = 0.0f;
+// Alpha for 1st-order IIR high-pass: fc=200Hz, fs=32kHz
+// alpha = exp(-2*pi*fc/fs) ≈ 0.9622
+#define HP_ALPHA 0.9622f
+
+static inline int16_t highpass_filter(int16_t sample) {
+    float x = (float)sample;
+    float y = HP_ALPHA * (hp_y_prev + x - hp_x_prev);
+    hp_x_prev = x;
+    hp_y_prev = y;
+    return (int16_t)y;
+}
 
 // === LED STATE MACHINE (Core 0 only, non-blocking) ===
 static wl_status_t last_wifi_status = WL_IDLE_STATUS;
@@ -121,7 +136,7 @@ static bool shine_encoder_init() {
     config.wave.channels = PCM_MONO;
     config.wave.samplerate = actual_sample_rate;
     config.mpeg.mode = MONO;
-    config.mpeg.bitr = 64;
+    config.mpeg.bitr = 128;
     config.mpeg.emph = NONE;
     config.mpeg.copyright = 0;
     config.mpeg.original = 1;
@@ -132,7 +147,7 @@ static bool shine_encoder_init() {
         return false;
     }
     Serial.printf("Shine encoder: %d samples/frame, %d Hz, %d kbps mono\n",
-                  shine_samples_per_pass(shine_enc), actual_sample_rate, 64);
+                  shine_samples_per_pass(shine_enc), actual_sample_rate, 128);
     return true;
 }
 
@@ -158,7 +173,8 @@ static void audio_encode_task(void *param) {
         for (int i = 0; i < samples_in_chunk; i++) {
             uint16_t raw_adc = (dma_buf[i] >> 4) & 0x0FFF;
             int16_t zero_centered = (int16_t)raw_adc - 2048;
-            pcm_frame[pcm_pos++] = zero_centered << 4;
+            int16_t filtered = highpass_filter(zero_centered << 4);
+            pcm_frame[pcm_pos++] = filtered;
 
             if (pcm_pos >= samples_per_pass) {
                 int written = 0;
