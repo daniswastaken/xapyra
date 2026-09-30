@@ -1,4 +1,5 @@
 ﻿#include <Arduino.h>
+#include <math.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <driver/i2s.h>
@@ -44,67 +45,118 @@ static unsigned long last_led_toggle = 0;
 static bool green_led_state = false;
 static unsigned long last_wifi_check = 0;
 
-// === HIGH-PASS FILTER (vocal focus, cut below 200Hz) ===
-// === HIGH-PASS FILTER (vocal focus, cut below 200Hz) ===
-static float hp_x_prev = 0.0f;
-static float hp_y_prev = 0.0f;
+// === INPUT TRIM (headroom for MAX4466 gain mentok) ===
+// MAX4466 pot full ~125x: ADC gampang rail. Trim dulu sebelum filter
+// biar flat-top clip tidak masuk rantai DSP.
+#define INPUT_TRIM_BASE 0.5f    // -6dB tetap
+static float input_trim_auto = 1.0f;  // 0.25..1.0, adaptif via clip detector
+static uint32_t clip_count = 0;
+static uint32_t total_samples = 0;
+
+// === HIGH-PASS 2-POLE (vocal, cut <200Hz, 12dB/oct) ===
+// 1-pole lama loyo: pop/wind lolos, picu pumping. Cascade 2x.
+static float hp1_x_prev = 0.0f, hp1_y_prev = 0.0f;
+static float hp2_x_prev = 0.0f, hp2_y_prev = 0.0f;
 #define HP_ALPHA 0.9622f
 
-static inline int16_t highpass_filter(int16_t sample) {
-    float x = (float)sample;
-    float y = HP_ALPHA * (hp_y_prev + x - hp_x_prev);
-    hp_x_prev = x;
-    hp_y_prev = y;
-    return (int16_t)y;
+static inline float highpass_stage(float x, float *x_prev, float *y_prev) {
+    float y = HP_ALPHA * (*y_prev + x - *x_prev);
+    *x_prev = x;
+    *y_prev = y;
+    return y;
 }
 
-// === LOW-PASS FILTER (cut above 4kHz for vocal isolation) ===
-static float lp_x_prev = 0.0f;
-static float lp_y_prev = 0.0f;
+// === LOW-PASS 2-POLE (cut >4kHz hiss, 12dB/oct) ===
+static float lp1_y_prev = 0.0f;
+static float lp2_y_prev = 0.0f;
 // fc=4000Hz, fs=32kHz → alpha = exp(-2*pi*fc/fs) ≈ 0.7788
 #define LP_ALPHA 0.7788f
 
-static inline int16_t lowpass_filter(int16_t sample) {
-    float x = (float)sample;
-    float y = LP_ALPHA * lp_y_prev + (1.0f - LP_ALPHA) * x;
-    lp_x_prev = x;
-    lp_y_prev = y;
-    return (int16_t)y;
+static inline float lowpass_stage(float x, float *y_prev) {
+    float y = LP_ALPHA * (*y_prev) + (1.0f - LP_ALPHA) * x;
+    *y_prev = y;
+    return y;
 }
 
-// === AGC (Automatic Gain Control) ===
+// === COMPRESSOR (soft-knee, anti-pecah transien) ===
+// Threshold -12dBFS, ratio 6:1, attack ~2ms, release ~150ms.
+// Ini yang jaga suara stabil saat teriak/dekat mic.
+static float comp_env = 0.0f;
+static float comp_gain = 1.0f;
+#define COMP_THRESH  8000.0f   // ~-12dBFS
+#define COMP_RATIO   6.0f
+#define COMP_ATK_ENV 0.02f     // envelope attack (~2ms)
+#define COMP_REL_ENV 0.0002f   // envelope release (~150ms)
+#define COMP_ATK_GAIN 0.1f     // gain turun cepat
+#define COMP_REL_GAIN 0.005f   // gain naik pelan
+
+static inline float compressor_process(float sample) {
+    float abs_in = fabsf(sample);
+    float a = (abs_in > comp_env) ? COMP_ATK_ENV : COMP_REL_ENV;
+    comp_env += a * (abs_in - comp_env);
+
+    float desired = 1.0f;
+    if (comp_env > COMP_THRESH) {
+        float compressed = COMP_THRESH + (comp_env - COMP_THRESH) / COMP_RATIO;
+        desired = compressed / comp_env;
+    }
+    float ga = (desired < comp_gain) ? COMP_ATK_GAIN : COMP_REL_GAIN;
+    comp_gain += ga * (desired - comp_gain);
+    return sample * comp_gain;
+}
+
+// === AGC (slow leveler + noise gate) ===
+// MAX_GAIN turun 8.0 -> 3.0: cegah hiss ikut kencang saat sepi.
+// Gate 500: di bawah itu gain freeze, tidak pumping.
 static float agc_peak = 1.0f;
 static float agc_gain = 1.0f;
 #define AGC_TARGET    20000.0f   // target peak level (~-6dB)
 #define AGC_ATTACK    0.1f      // fast attack (gain down)
 #define AGC_RELEASE   0.001f    // slow release (gain up)
-#define AGC_MAX_GAIN  8.0f
+#define AGC_MAX_GAIN  3.0f
 #define AGC_MIN_GAIN  0.1f
+#define AGC_GATE      500.0f    // freeze di bawah ini
 
-static inline int16_t agc_process(int16_t sample) {
-    float abs_sample = fabsf((float)sample);
+static inline float agc_process(float sample) {
+    float abs_sample = fabsf(sample);
 
-    // Update peak with decay (leaky peak detector)
     if (abs_sample > agc_peak) {
-        agc_peak = abs_sample;  // instant attack
+        agc_peak = abs_sample;
     } else {
-        agc_peak = agc_peak * 0.9999f;  // slow decay
+        agc_peak = agc_peak * 0.9999f;
     }
     if (agc_peak < 1.0f) agc_peak = 1.0f;
 
-    // Calculate desired gain
     float desired_gain = AGC_TARGET / agc_peak;
     if (desired_gain > AGC_MAX_GAIN) desired_gain = AGC_MAX_GAIN;
     if (desired_gain < AGC_MIN_GAIN) desired_gain = AGC_MIN_GAIN;
 
-    // Smooth gain change (fast attack, slow release)
+    // Noise gate: jangan naikkan gain saat senyap
+    if (agc_peak < AGC_GATE && desired_gain > agc_gain) {
+        desired_gain = agc_gain;
+    }
+
     float alpha = (desired_gain < agc_gain) ? AGC_ATTACK : AGC_RELEASE;
     agc_gain = agc_gain + alpha * (desired_gain - agc_gain);
+    return sample * agc_gain;
+}
 
-    float output = (float)sample * agc_gain;
-    if (output > 32767.0f) output = 32767.0f;
-    if (output < -32767.0f) output = -32767.0f;
-    return (int16_t)output;
+// === LIMITER + SOFT CLIP (brickwall -3dB, anti pecah digital) ===
+// Sisa peak lewat kompresor/AGC dilembutkan di sini, bukan hard-clip.
+#define LIMIT_THRESH 23170.0f  // -3dBFS
+#define LIMIT_KNEE   6000.0f
+
+static inline int16_t limiter_softclip(float sample) {
+    float abs_in = fabsf(sample);
+    if (abs_in <= LIMIT_THRESH) {
+        return (int16_t)sample;
+    }
+    float sign = (sample >= 0.0f) ? 1.0f : -1.0f;
+    float over = abs_in - LIMIT_THRESH;
+    // 1-exp soft knee: makin keras makin padat, tidak flat
+    float soft = LIMIT_THRESH + (32768.0f - LIMIT_THRESH) * (1.0f - expf(-over / LIMIT_KNEE));
+    if (soft > 32767.0f) soft = 32767.0f;
+    return (int16_t)(sign * soft);
 }
 
 // === LED STATE MACHINE (Core 0 only, non-blocking) ===
@@ -220,14 +272,42 @@ static void audio_encode_task(void *param) {
 
         for (int i = 0; i < samples_in_chunk; i++) {
             uint16_t raw_adc = (dma_buf[i] >> 4) & 0x0FFF;
-            int16_t zero_centered = (int16_t)raw_adc - 2048;
-            int16_t sample = zero_centered << 4;
+            total_samples++;
+            if (raw_adc <= 3 || raw_adc >= 4092) clip_count++;
 
-            // Audio pipeline: HP → LP → AGC → encode
-            sample = highpass_filter(sample);
-            sample = lowpass_filter(sample);
+            int16_t zero_centered = (int16_t)raw_adc - 2048;
+            float sample = (float)(zero_centered << 4);
+
+            // Trim headroom dulu (penting saat gain mentok)
+            sample *= (INPUT_TRIM_BASE * input_trim_auto);
+
+            // Audio pipeline: HPx2 → LPx2 → COMP → AGC → LIMIT/SOFTCLIP → encode
+            sample = highpass_stage(sample, &hp1_x_prev, &hp1_y_prev);
+            sample = highpass_stage(sample, &hp2_x_prev, &hp2_y_prev);
+            sample = lowpass_stage(sample, &lp1_y_prev);
+            sample = lowpass_stage(sample, &lp2_y_prev);
+            sample = compressor_process(sample);
             sample = agc_process(sample);
-            pcm_frame[pcm_pos++] = sample;
+            pcm_frame[pcm_pos++] = limiter_softclip(sample);
+
+            // Auto-trim 1x/detik: clip >0.5% turunkan, <0.05% naikkan pelan
+            if (total_samples % 32000 == 0) {
+                static uint32_t last_clip = 0;
+                static uint32_t last_total = 0;
+                uint32_t d_clip = clip_count - last_clip;
+                uint32_t d_tot = total_samples - last_total;
+                last_clip = clip_count;
+                last_total = total_samples;
+                if (d_tot > 0) {
+                    float rate = (float)d_clip / (float)d_tot;
+                    if (rate > 0.005f && input_trim_auto > 0.26f) {
+                        input_trim_auto *= 0.9f;
+                    } else if (rate < 0.0005f && input_trim_auto < 1.0f) {
+                        input_trim_auto *= 1.02f;
+                        if (input_trim_auto > 1.0f) input_trim_auto = 1.0f;
+                    }
+                }
+            }
 
             if (pcm_pos >= samples_per_pass) {
                 int written = 0;
@@ -363,8 +443,10 @@ void setup() {
 // === LOOP (runs on Core 1, minimal work) ===
 void loop() {
     if (frames_encoded % 100 == 0 && frames_encoded > 0) {
-        Serial.printf("Encoded: %u | Dropped: %u | Rate: %u Hz | Client: %s\n",
-                      frames_encoded, frames_dropped, actual_sample_rate,
+        float clip_pct = total_samples ? (100.0f * (float)clip_count / (float)total_samples) : 0.0f;
+        Serial.printf("Enc:%u Drop:%u Clip:%.2f%% trim:%.2f comp:%.2f agc:%.2f | Client:%s\n",
+                      frames_encoded, frames_dropped, clip_pct,
+                      INPUT_TRIM_BASE * input_trim_auto, comp_gain, agc_gain,
                       client_connected ? "YES" : "NO");
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
