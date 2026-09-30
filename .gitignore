@@ -1,5 +1,17 @@
 .pio
-.vscode/.browse.c_cpp.db*
+.vscode/.browse_c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# retrieval server audio output (captures, test runs -- never commit audio)
+server/recordings/
+recordings/
+server/capture/
+server/t1/
+server/t2/
+server/t3/
+server/align/
+server/out*/
+*.mp3
+__pycache__/
