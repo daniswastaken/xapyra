@@ -19,6 +19,26 @@ extern "C" {
 #define PIN_RED_LED     25
 #define PIN_GREEN_LED   26
 
+// === LED PWM (ESP32 LEDC hardware PWM) ===
+// Driver LED di GPIO25/26 disetel digitalWrite HIGH = 100% duty = blazing.
+// Pakai LEDC supaya bisa dimorph via duty cycle, tanpa software ISR.
+// 5kHz: jauh di atas batas kedip mata/kamera, dan Aman untuk audio
+// (I2S + encoder jalan terus, PWM tak boleh jadi sumber desis).
+#define LED_PWM_FREQ        5000
+#define LED_PWM_BITS        8
+#define LED_PWM_MAX         ((1 << LED_PWM_BITS) - 1)   // 255 == duty penuh
+
+// Brightness relatif 0..255. Turunin = redup.
+// Hijau kelihatan lebih terang dari merah pada arus sama, jadi
+// nilainya dibedain sedikit.
+#define LED_BRIGHT_RED      25    // ~10%
+#define LED_BRIGHT_GREEN    30    // ~12%
+
+// Channel LEDC: 4 dan 6 -> timer berbeda (2 dan 3), jadi freq/resolution
+// masing-masing LED bisa diubah sendiri-sendiri nanti.
+#define LED_CH_RED          4
+#define LED_CH_GREEN        6
+
 #define I2S_PORT        I2S_NUM_0
 #define ADC_CHANNEL     ADC1_CHANNEL_7
 #define TARGET_SAMPLE_RATE 32000
@@ -26,7 +46,13 @@ extern "C" {
 #define DMA_BUF_LEN     512
 
 #define RING_BUF_SIZE   (32 * 1024)
-#define LED_FLICKER_MS  100
+// Green LED saat streaming: bukan flicker lagi, tapi "blip" activity.
+// Nyala sebentar (ON), lalu mati lama (OFF). Sekitar 0.5 Hz.
+// Sekadar bukti audio mengalir, tidak menyilaukan ruangan
+// waktu stream berjalan lama.
+#define LED_BEEP_ON_MS   60
+#define LED_BEEP_OFF_MS  2000
+#define LED_BEEP_LEAD_MS 120   // jeda sebelum blip pertama pas mulai transfer
 #define WIFI_CHECK_MS   2000
 
 // === GLOBALS ===
@@ -41,8 +67,9 @@ static volatile uint32_t actual_sample_rate = TARGET_SAMPLE_RATE;
 static uint32_t frames_encoded = 0;
 static uint32_t frames_dropped = 0;
 
-static unsigned long last_led_toggle = 0;
+static uint32_t next_green_change = 0;   // ms epoch untuk transisi blip berikutnya
 static bool green_led_state = false;
+static bool green_was_streaming = false; // detek masuk/keluar state streaming
 static unsigned long last_wifi_check = 0;
 
 // === INPUT TRIM (headroom for MAX4466 gain mentok) ===
@@ -162,6 +189,29 @@ static inline int16_t limiter_softclip(float sample) {
 // === LED STATE MACHINE (Core 0 only, non-blocking) ===
 static wl_status_t last_wifi_status = WL_IDLE_STATUS;
 
+// Brightness 0..255 -> duty 0..LED_PWM_MAX (0 = mati, 255 = duty penuh)
+static inline uint8_t led_duty(uint8_t brightness) {
+    return (uint8_t)((uint32_t)brightness * LED_PWM_MAX / 255u);
+}
+
+// Tulis duty lewat hardware PWM. on=false -> duty 0 (mati, bukan "redup").
+static inline void led_red(bool on) {
+    ledcWrite(LED_CH_RED, on ? led_duty(LED_BRIGHT_RED) : 0);
+}
+
+static inline void led_green(bool on) {
+    ledcWrite(LED_CH_GREEN, on ? led_duty(LED_BRIGHT_GREEN) : 0);
+}
+
+static void led_pwm_init() {
+    ledcSetup(LED_CH_RED,   LED_PWM_FREQ, LED_PWM_BITS);
+    ledcSetup(LED_CH_GREEN, LED_PWM_FREQ, LED_PWM_BITS);
+    ledcAttachPin(PIN_RED_LED,   LED_CH_RED);
+    ledcAttachPin(PIN_GREEN_LED, LED_CH_GREEN);
+    led_red(true);      // boot: merah nyalain, hijau mati
+    led_green(false);
+}
+
 static void led_update() {
     unsigned long now = millis();
 
@@ -176,23 +226,35 @@ static void led_update() {
     }
 
     if (!wifi_connected) {
-        digitalWrite(PIN_RED_LED, HIGH);
-        digitalWrite(PIN_GREEN_LED, LOW);
+        led_red(true);
+        led_green(false);
         green_led_state = false;
+        green_was_streaming = false;
+        next_green_change = 0;
         return;
     }
 
-    digitalWrite(PIN_RED_LED, LOW);
+    led_red(false);
 
     if (streaming_active && client_connected) {
-        if (now - last_led_toggle >= LED_FLICKER_MS) {
-            last_led_toggle = now;
+        if (!green_was_streaming) {
+            // Baru masuk state streaming: padam dulu, blip menyusul
+            // sebentar. Kalau ga di-reset, LED bakal nyala solid
+            // sampai 2 detik sebelum blip pertama.
+            green_was_streaming = true;
+            green_led_state = false;
+            led_green(false);
+            next_green_change = now + LED_BEEP_LEAD_MS;
+        } else if ((int32_t)(now - next_green_change) >= 0) {
+            // Rollover-safe: signed diff, bukan unsigned `now >= deadline`.
             green_led_state = !green_led_state;
-            digitalWrite(PIN_GREEN_LED, green_led_state ? HIGH : LOW);
+            led_green(green_led_state);
+            next_green_change = now + (green_led_state ? LED_BEEP_ON_MS : LED_BEEP_OFF_MS);
         }
     } else {
-        digitalWrite(PIN_GREEN_LED, HIGH);
+        led_green(true);
         green_led_state = true;
+        green_was_streaming = false;
     }
 }
 
@@ -403,8 +465,7 @@ void setup() {
 
     pinMode(PIN_RED_LED, OUTPUT);
     pinMode(PIN_GREEN_LED, OUTPUT);
-    digitalWrite(PIN_RED_LED, HIGH);
-    digitalWrite(PIN_GREEN_LED, LOW);
+    led_pwm_init();
 
     mp3_ring_buf = xRingbufferCreate(RING_BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
     if (!mp3_ring_buf) {

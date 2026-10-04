@@ -53,7 +53,7 @@ Xapyra is a **minimal, focused ESP32 audio streamer**. No cloud dependencies, no
 | **AGC** | Automatic gain control normalizes levels to ~-6 dB peak |
 | **Encode** | Shine MP3 encoder — 128 kbps mono |
 | **Stream** | TCP server on port 8080, streams MP3 frames to connected client |
-| **Status** | Red LED = WiFi down, Green LED solid = idle, Green LED flicker = streaming |
+| **Status** | Red LED = WiFi down, Green LED solid = idle, Green LED blip = streaming |
 
 ## Architecture
 
@@ -120,7 +120,7 @@ nc <ESP32_IP> 8080 | mpv -
 ncat <ESP32_IP> 8080 | mpv -
 ```
 
-4. Green LED flickers while streaming
+4. Green LED gives a short blip about every 2 seconds while streaming
 
 ## Configuration
 
@@ -151,6 +151,19 @@ Edit `src/main.cpp` — all settings are `#define` constants at the top:
 | `AGC_MAX_GAIN` | 8.0 | Maximum AGC gain |
 | `AGC_ATTACK` | 0.1 | Gain reduction speed |
 | `AGC_RELEASE` | 0.001 | Gain recovery speed |
+
+### LED Tuning
+
+LEDs are dimmed with ESP32 hardware PWM (LEDC) at 5 kHz / 8-bit, not
+`digitalWrite`. Brightness values are relative 0–255; `0` is fully off.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `LED_BRIGHT_RED` | 25 | Red LED brightness (~10% duty) |
+| `LED_BRIGHT_GREEN` | 30 | Green LED brightness (~12% duty) |
+| `LED_BEEP_ON_MS` | 60 | Green LED blip length while streaming |
+| `LED_BEEP_OFF_MS` | 2000 | Green LED dark gap between blips (~0.5 Hz) |
+| `LED_PWM_FREQ` | 5000 | PWM carrier — keep above flicker/audible range |
 
 ## Hardware
 
