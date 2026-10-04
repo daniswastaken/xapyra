@@ -16,7 +16,11 @@ Python 3.9+, standard library only. No `pip install`, no virtualenv needed.
 ## Run
 
 ```bash
-# from the repo root -- your ESP32's IP (printed on the serial monitor at boot)
+# from the repo root -- let it find the ESP32 itself, with a live dashboard
+python server/retrieval_server.py --device-host auto --tui \
+  --outdir server/capture --file test123.mp3
+
+# or pin the IP you saw on the serial monitor
 python server/retrieval_server.py --device-host 192.168.137.156 \
   --outdir server/capture --file test123.mp3
 ```
@@ -32,7 +36,10 @@ LED will not blink.
 
 | Flag | Env var | Default | Meaning |
 |---|---|---|---|
-| `--device-host` | `XAPYRA_DEVICE_HOST` | `127.0.0.1` | ESP32 IP or hostname |
+| `--device-host` | `XAPYRA_DEVICE_HOST` | `127.0.0.1` | ESP32 IP, hostname, or `auto` to scan the LAN for port 8080 |
+| `--scan-subnet` | | every local /24 | limit `auto` to a CIDR (repeatable, /24 or smaller) |
+| `--scan-timeout` | `XAPYRA_SCAN_TIMEOUT` | `0.4` | per-host connect timeout for `auto` |
+| `--tui` | | off | live terminal dashboard (betterVpack-style) instead of log lines |
 | `--device-port` | `XAPYRA_DEVICE_PORT` | `8080` | ESP32 TCP port (`TCP_PORT`) |
 | `--http-host` | `XAPYRA_HTTP_HOST` | `0.0.0.0` | bind address |
 | `--http-port` | `XAPYRA_HTTP_PORT` | `8081` | bind port; `0` picks a free one |
