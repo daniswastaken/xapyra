@@ -327,6 +327,26 @@ async def test_app_and_engine(tmp: Path) -> list[tuple[str, bool, str]]:
     out.append(("live refresher polls the provider", len(calls) >= 2, f"{len(calls)}x"))
     out.append(("live refresher stops clean", ui._live_state["thread"] is None, ""))
 
+    # engine log routing: queue, flush into history, uninstall restores stderr.
+    import logging
+
+    ui.install_tui_logging()
+    lg = logging.getLogger("xapyra.test-routing")
+    lg.warning("device idle for 20s, dropping link")
+    out.append(("engine log line queued, not printed", len(ui._log_queue) == 1, ""))
+    buf = io.StringIO()
+    ui._scroll_end = 15
+    with contextlib.redirect_stdout(buf):
+        ui.flush_pending_logs()
+    shot = buf.getvalue()
+    out.append(("queued line flushes into history", "dropping link" in shot and "WARNING" in shot, ""))
+    out.append(("flush drains the queue", len(ui._log_queue) == 0, ""))
+    out.append(("flush stays inside scroll margins", f"\033[{15};1H" in shot, ""))
+    ui.uninstall_tui_logging()
+    root = logging.getLogger("xapyra")
+    out.append(("uninstall detaches handler", not any(isinstance(h, ui.TuiLogQueueHandler) for h in root.handlers), ""))
+    out.append(("uninstall restores propagation", root.propagate is True, ""))
+
     # engine roundtrip vs fake hardware.
     dev = subprocess.Popen(
         [sys.executable, str(HERE / "fake_device.py"), "--port", "18180", "--speed", "1"],
@@ -385,6 +405,103 @@ async def test_cli_single_serve(tmp: Path) -> list[tuple[str, bool, str]]:
     finally:
         dev.kill()
         dev.wait()
+    return out
+
+
+async def test_engine_log_routing(tmp: Path) -> list[tuple[str, bool, str]]:
+    """Engine thread logs must land in the TUI queue, not on the input bar."""
+    import logging
+    import time
+
+    from src import ui
+    from src.engine import Config, Engine
+
+    out: list[tuple[str, bool, str]] = []
+    dev = subprocess.Popen(
+        [sys.executable, str(HERE / "fake_device.py"), "--port", "18160", "--speed", "1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.sleep(1.0)
+        ui.install_tui_logging()
+        logging.getLogger("xapyra").setLevel(logging.DEBUG)
+        try:
+            eng = Engine()
+            await asyncio.to_thread(
+                eng.start,
+                Config(device_host="127.0.0.1", device_port=18160,
+                       http_host="127.0.0.1", http_port=18161,
+                       outdir=tmp / "rout", filename="r.mp3"),
+            )
+            deadline = time.monotonic() + 10.0
+            seen = ""
+            while time.monotonic() < deadline:
+                seen = "\n".join(list(ui._log_queue))
+                if "device connected" in seen:
+                    break
+                await asyncio.sleep(0.2)
+            out.append(("worker-thread connect log queued", "device connected" in seen, seen[:100]))
+            await asyncio.to_thread(eng.stop)
+        finally:
+            ui.uninstall_tui_logging()
+            logging.getLogger("xapyra").setLevel(logging.WARNING)
+    finally:
+        dev.kill()
+        dev.wait()
+    return out
+
+
+async def test_stall_warn_and_drop(tmp: Path) -> list[tuple[str, bool, str]]:
+    """The exact field failure: socket open, bytes stop. Expect a STALL
+    warning at ~5s (not silence), link held until the ~20s idle drop."""
+    import contextlib
+    import logging
+    from unittest import mock
+
+    from src.audio import link as link_mod
+
+    out: list[tuple[str, bool, str]] = []
+
+    async def stall_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.write(b"\xff\xfb\x94\xc0" + b"\x00" * 572)
+        await writer.drain()
+        await asyncio.sleep(30)  # hold the socket open, send nothing more
+
+    srv = await asyncio.start_server(stall_handler, "127.0.0.1", 18150)
+    records: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record) -> None:
+            records.append(record.getMessage())
+
+    cap = Capture()
+    logging.getLogger("xapyra.link").addHandler(cap)
+    try:
+        ring = rs_ring.AudioRing(20, 128)
+        rec = rs_rec.Recorder(tmp / "stall")
+        link = rs_link.DeviceLink("127.0.0.1", 18150, ring, rec, True, 1.0, 128)
+        task = asyncio.create_task(link.run(), name="stall-link")
+        try:
+            with mock.patch.object(link_mod, "IDLE_SESSION_TIMEOUT", 8.0):
+                assert await wait_for(lambda: link.connected, 5, "stall session up")
+                await asyncio.sleep(6.5)  # past STALL_AFTER, before the drop
+                t = link.timing_stats()
+                out.append(("stalled while socket open", t.get("stalled") is True, str(t.get("seconds_since_byte"))))
+                out.append(("still connected during stall", link.connected is True, ""))
+                out.append(("stall warning logged once", sum("no audio for" in m for m in records) == 1, ""))
+                # The stall server still accepts, so the drop is followed by an
+                # instant reconnect: sessions advancing proves the cycle.
+                assert await wait_for(lambda: link.sessions >= 2, 8, "idle drop + reconnect")
+                out.append(("quiet link dropped, reconnect loop alive", task.done() is False, ""))
+        finally:
+            link.close()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    finally:
+        logging.getLogger("xapyra.link").removeHandler(cap)
+        srv.close()
     return out
 
 
@@ -577,6 +694,16 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as cli_td:
         print("\n[0f] CLI serves the stream exactly once")
         for name, ok, detail in asyncio.run(test_cli_single_serve(Path(cli_td))):
+            check(name, ok, detail)
+
+    with tempfile.TemporaryDirectory() as rout_td:
+        print("\n[0g] engine logs route to the TUI queue")
+        for name, ok, detail in asyncio.run(test_engine_log_routing(Path(rout_td))):
+            check(name, ok, detail)
+
+    with tempfile.TemporaryDirectory() as stall_td:
+        print("\n[0h] stall warns, then drops (field failure replay)")
+        for name, ok, detail in asyncio.run(test_stall_warn_and_drop(Path(stall_td))):
             check(name, ok, detail)
 
     with tempfile.TemporaryDirectory() as td:

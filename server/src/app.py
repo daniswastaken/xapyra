@@ -80,7 +80,10 @@ def _chat_status(ctx: Ctx) -> dict:
     dev = st["device"]
     rec = st.get("recording", {})
     t = st.get("timing", {})
-    live = "LIVE" if dev.get("connected") else "DOWN"
+    if dev.get("stalled"):
+        live = "STALL"
+    else:
+        live = "LIVE" if dev.get("connected") else "DOWN"
     rname = rec.get("path") if rec.get("active") else "idle"
     drift = t.get("drift_seconds", 0.0) or 0.0
     return {
@@ -111,6 +114,7 @@ def handle(line: str, ctx: Ctx) -> bool:
     cmd, args = parts[0].lower(), parts[1:]
     if cmd in ("exit", "quit", "q"):
         ui.stop_live_status()
+        ui.uninstall_tui_logging()
         if ctx.engine.running:
             ctx.engine.stop()
         ui.info("Goodbye!")
@@ -158,6 +162,7 @@ def start(simple: bool = False):
         return
     try:
         ui.setup_tui()
+        ui.install_tui_logging()
         ctx = Ctx()
         ui.start_live_status(lambda: _chat_status(ctx))
         ui.info("Xapyra shell -- type 'help'. 'scan' finds the ESP32, 'record' captures.")
@@ -176,12 +181,14 @@ def start(simple: bool = False):
         # and never die silent: the traceback is the diagnosis.
         try:
             ui.stop_live_status()
+            ui.uninstall_tui_logging()
             ui.reset_tui()
         finally:
             traceback.print_exc()
         raise SystemExit(1)
     finally:
         ui.stop_live_status()
+        ui.uninstall_tui_logging()
 
 
 def _linear_loop():

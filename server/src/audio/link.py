@@ -17,6 +17,11 @@ from src.audio._common import (
 
 LOG = logging.getLogger("xapyra.link")
 
+# Read loop polls in short slices so a quiet-but-open socket is noticed fast:
+# STALL_AFTER warns (link up, no bytes), IDLE_SESSION_TIMEOUT drops it.
+READ_POLL = 1.0
+STALL_AFTER = 5.0
+
 # --------------------------------------------------------------------------- #
 class DeviceLink:
     """Holds the TCP connection to the device and fans bytes out to subscribers."""
@@ -53,6 +58,8 @@ class DeviceLink:
         self.first_byte_wall: float | None = None
         self.session_start_mono: float | None = None
         self.session_first_byte_mono: float | None = None
+        self.last_byte_mono: float | None = None
+        self._stall_warned = False
         self.connected_seconds = 0.0
         self._subscribers: set[asyncio.Queue] = set()
         self._closing = False
@@ -73,6 +80,17 @@ class DeviceLink:
         if self.connected and self.session_first_byte_mono is not None:
             connected += now_mono - self.session_first_byte_mono
         audio = self.total_bytes / bps
+        if self.last_byte_mono is not None:
+            seconds_since_byte = now_mono - self.last_byte_mono
+        elif self.connected:
+            seconds_since_byte = now_mono - (self.session_start_mono or now_mono)
+        else:
+            seconds_since_byte = None
+        stalled = bool(
+            self.connected
+            and seconds_since_byte is not None
+            and seconds_since_byte >= STALL_AFTER
+        )
         if self.first_byte_mono is not None:
             wall = now_mono - self.first_byte_mono
             gap = wall - connected
@@ -85,6 +103,8 @@ class DeviceLink:
                 "drift_seconds": round(audio - wall, 3),
                 "drift_ratio": round((audio - wall) / wall, 5) if wall > 0 else None,
                 "drift_vs_connected": round(audio - connected, 3),
+                "seconds_since_byte": round(seconds_since_byte, 3) if seconds_since_byte is not None else None,
+                "stalled": stalled,
                 "observed_bytes_per_sec": round(self.total_bytes / wall, 1) if wall > 0 else None,
                 "observed_connected_bps": round(self.total_bytes / connected, 1) if connected > 0 else None,
                 "expected_bytes_per_sec": bps,
@@ -99,6 +119,8 @@ class DeviceLink:
                 "drift_seconds": 0.0,
                 "drift_ratio": None,
                 "drift_vs_connected": 0.0,
+                "seconds_since_byte": round(seconds_since_byte, 3) if seconds_since_byte is not None else None,
+                "stalled": stalled,
                 "observed_bytes_per_sec": None,
                 "observed_connected_bps": None,
                 "expected_bytes_per_sec": bps,
@@ -187,6 +209,7 @@ class DeviceLink:
         self.connected_since = time.time()
         self.session_start_mono = time.monotonic()
         self.session_first_byte_mono = None
+        self._stall_warned = False
         self.last_error = None
         if self.record:
             self.recorder.start()
@@ -194,10 +217,9 @@ class DeviceLink:
         try:
             while not self._closing:
                 try:
-                    data = await asyncio.wait_for(reader.read(IO_CHUNK // 8), timeout=IDLE_SESSION_TIMEOUT)
+                    data = await asyncio.wait_for(reader.read(IO_CHUNK // 8), timeout=READ_POLL)
                 except asyncio.TimeoutError:
-                    LOG.warning("device idle for %.0fs, dropping link", IDLE_SESSION_TIMEOUT)
-                    break
+                    data = None  # no chunk this poll; stall/drop decided below
                 except (ConnectionResetError, ConnectionAbortedError, OSError) as exc:
                     # Peer vanished mid-read (killed, WiFi drop, router reset). The
                     # socket never reaches EOF, so this raises instead of returning
@@ -205,22 +227,38 @@ class DeviceLink:
                     # the reconnect loop for good.
                     LOG.info("device link lost: %s", exc)
                     break
-                if not data:
+                now_mono = time.monotonic()
+                if data:
+                    if self.session_first_byte_mono is None:
+                        self.session_first_byte_mono = now_mono
+                    if self.first_byte_mono is None:
+                        self.first_byte_mono = now_mono
+                        self.first_byte_wall = time.time()
+                        LOG.info("first audio byte received -- 1:1 timer started")
+                    self.last_byte_mono = now_mono
+                    self._stall_warned = False
+                    self.ring.append(data)
+                    if self.record:
+                        self.recorder.write(data)
+                    self._fanout(data)
+                    self.session_bytes += len(data)
+                    self.total_bytes += len(data)
+                    continue
+                # No chunk this poll: data may be an empty EOF or just late.
+                if data == b"":
                     LOG.info("device closed the stream")
                     break
-                now_mono = time.monotonic()
-                if self.session_first_byte_mono is None:
-                    self.session_first_byte_mono = now_mono
-                if self.first_byte_mono is None:
-                    self.first_byte_mono = now_mono
-                    self.first_byte_wall = time.time()
-                    LOG.info("first audio byte received -- 1:1 timer started")
-                self.ring.append(data)
-                if self.record:
-                    self.recorder.write(data)
-                self._fanout(data)
-                self.session_bytes += len(data)
-                self.total_bytes += len(data)
+                quiet_for = now_mono - (self.last_byte_mono or self.session_start_mono or now_mono)
+                if quiet_for >= IDLE_SESSION_TIMEOUT:
+                    LOG.warning("device idle for %.0fs, dropping link", quiet_for)
+                    break
+                if quiet_for >= STALL_AFTER and not self._stall_warned:
+                    self._stall_warned = True
+                    LOG.warning(
+                        "no audio for %.0fs although the link is up -- "
+                        "mic/encoder stall or WiFi stall on the device",
+                        quiet_for,
+                    )
         finally:
             self.connected = False
             self.connected_since = None

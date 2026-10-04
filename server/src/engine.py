@@ -98,19 +98,21 @@ class Engine:
         if self._link is None:
             return {"running": False}
         link = self._link
+        timing = link.timing_stats()
         st = {
             "running": True,
             "device": {
                 "host": link.host,
                 "port": link.port,
                 "connected": link.connected,
+                "stalled": timing.get("stalled", False),
                 "sessions": link.sessions,
                 "session_bytes": link.session_bytes,
                 "total_bytes": link.total_bytes,
                 "connected_since": None,
                 "last_error": link.last_error,
             },
-            "timing": link.timing_stats(),
+            "timing": timing,
             "ring": link.ring.stats(),
             "recording": link.recorder.stats() if link.record else {"active": False},
             "server": {"host": self.config.http_host if self.config else "?", "port": self.http_port},

@@ -312,18 +312,20 @@ class RetrievalService(HttpServer):
         return json.dumps(payload, indent=2).encode()
 
     def _status(self) -> dict:
+        timing = self.link.timing_stats()
         return {
             "device": {
                 "host": self.link.host,
                 "port": self.link.port,
                 "connected": self.link.connected,
+                "stalled": timing.get("stalled", False),
                 "sessions": self.link.sessions,
                 "session_bytes": self.link.session_bytes,
                 "total_bytes": self.link.total_bytes,
                 "connected_since": iso(self.link.connected_since),
                 "last_error": self.link.last_error,
             },
-            "timing": self.link.timing_stats(),
+            "timing": timing,
             "ring": self.ring.stats(),
             "recording": self.recorder.stats(),
             "recordings": list_recordings(self.outdir),

@@ -1,16 +1,33 @@
 """Start a capture run: pick device, pick output file, spin up the engine."""
+import asyncio
 from datetime import datetime
 from pathlib import Path
 
 from src import ui
 from src.cli import safe_output_name
 from src.engine import Config
+from src.net.discover import DEFAULT_PORT, discover, probe
+
+
+def _fresh_devices(ctx) -> list[str]:
+    """Cached last_scan goes stale across device reboots -- DHCP hands out a
+    new IP (e.g. after flashing, or a new hostname like Xapyra-o3). Re-probe
+    the cached host(s); silently rescan when they're gone so `record` never
+    dials a dead IP."""
+    cached = list(ctx.last_scan or [])
+    if cached and all(asyncio.run(probe(h, DEFAULT_PORT, 1.0)) for h in cached):
+        return cached
+    found = asyncio.run(discover(DEFAULT_PORT))
+    ctx.last_scan = found
+    if found != cached:
+        ui.info("Device IP changed since the last scan -- refreshed.")
+    return found
 
 
 def _pick_host(ctx) -> str | None:
-    found = ctx.last_scan
+    found = _fresh_devices(ctx)
     if len(found) == 1:
-        ui.info(f"Using {found[0]} from the last scan (run 'scan' to refresh).")
+        ui.info(f"Using {found[0]} (verified live just now).")
         if ui.prompt_confirm("Record from here?", default=True):
             return found[0]
     elif len(found) > 1:

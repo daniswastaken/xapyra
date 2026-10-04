@@ -9,6 +9,7 @@ are Xapyra additions in the same visual language.
 """
 import asyncio
 import io
+import logging
 import os
 import sys
 import shutil
@@ -108,13 +109,14 @@ def _draw_banner(h, w):
     Vpack logo remains anchored at the top of the viewport.
     """
     if h >= 28:
-        # Full banner for tall terminals
+        # Full banner for tall terminals. Built on a strict 7+2 grid per
+        # letter -- hand-typed rows drift and blur glyphs into each other.
         art = (
-            "██   ██  █████  ██████  ██   ██  ██████   █████ \n"
-            " ██ ██  ██   ██ ██   ██  ██ ██   ██   ██ ██   ██\n"
-            "   █    ███████ ██████    ███    ██████  ███████\n"
-            " ██ ██  ██   ██ ██       ██ ██   ██   ██ ██   ██\n"
-            "██   ██ ██   ██ ██      ██   ██  ██   ██ ██   ██ "
+            "██   ██   █████   ██████   ██   ██  ██████    █████ \n"
+            " ██ ██   ██   ██  ██   ██   ██ ██   ██   ██  ██   ██\n"
+            "  ██     ███████  ██████     ██     ██████   ███████\n"
+            " ██ ██   ██   ██  ██         ██     ██   ██  ██   ██\n"
+            "██   ██  ██   ██  ██         ██     ██   ██  ██   ██"
         )
         print(f"\n{_apply_gradient(art)}\n")
         scroll_start = 10
@@ -484,6 +486,9 @@ def _live_loop():
             continue
         safe_w = get_terminal_width() - 1
         r8, r9 = _status_rows(safe_w, row, status)
+        if _tui_active[0] and sys.stdout.isatty():
+            with _live_lock:
+                flush_pending_logs()
         key = (r8, r9)
         if key == _live_state["last"]:
             continue
@@ -493,6 +498,62 @@ def _live_loop():
             # its position because it lives on a different row.
             sys.stdout.write("\033[s" + r8 + "\033[K" + r9 + "\033[K\033[u")
             sys.stdout.flush()
+
+
+# -- engine log routing ------------------------------------------------------- #
+# Background engine logs (worker thread) bypass print() and land wherever the
+# cursor happens to sit -- usually the input bar or the status rows. Instead
+# they queue here and the live refresher flushes them into the scroll region
+# (the middle history section) under the same lock as the chatbox paint, so
+# command output and engine output can never tear each other.
+import collections
+
+_log_queue: collections.deque = collections.deque(maxlen=200)
+_tui_active = [False]
+
+
+class TuiLogQueueHandler(logging.Handler):
+    """logging.Handler that parks formatted records for the refresher."""
+
+    def emit(self, record) -> None:
+        try:
+            _log_queue.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+def install_tui_logging() -> None:
+    """Funnel every xapyra.* logger into the scroll region. Idempotent."""
+    root = logging.getLogger("xapyra")
+    for h in root.handlers:
+        if isinstance(h, TuiLogQueueHandler):
+            return
+    handler = TuiLogQueueHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"
+    ))
+    root.addHandler(handler)
+    root.propagate = False
+    _tui_active[0] = True
+
+
+def uninstall_tui_logging() -> None:
+    """Detach the queue handler; logging falls back to plain stderr."""
+    root = logging.getLogger("xapyra")
+    root.handlers = [h for h in root.handlers if not isinstance(h, TuiLogQueueHandler)]
+    root.propagate = True
+    _tui_active[0] = False
+    _log_queue.clear()
+
+
+def flush_pending_logs() -> None:
+    """Paint queued engine lines into the scroll-region history. Lock-held."""
+    while _log_queue:
+        line = _log_queue.popleft()
+        # Save cursor, jump to the history bottom, scroll once, write, restore.
+        # The write stays inside the margins, so input/status rows are safe.
+        sys.stdout.write(f"\033[s\033[{_scroll_end};1H\n{line}\033[u")
+    sys.stdout.flush()
 
 
 def show_command_table(commands):
@@ -646,7 +707,11 @@ def render(st: dict) -> str:
     rec = st.get("recording", {})
 
     live = bool(dev.get("connected"))
-    dot = f"{GREEN}LIVE{RESET}" if live else f"{RED}DOWN{RESET}"
+    stalled = bool(dev.get("stalled"))
+    if stalled:
+        dot = f"{YELLOW}STALL{RESET}"
+    else:
+        dot = f"{GREEN}LIVE{RESET}" if live else f"{RED}DOWN{RESET}"
     head = f"XAPYRA {dev.get('host', '?')}:{dev.get('port', '?')}  [{dot}]"
 
     total = dev.get("total_bytes", 0) or 0

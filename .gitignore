@@ -20,3 +20,4 @@ __pycache__/
 # opencode tool logs (the loop *.json session files predate this rule
 # and are still tracked)
 .opencode/opencode-loop/loop.log
+.opencode
