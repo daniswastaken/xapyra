@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
-"""Voice-focused post-processing for Xapyra captures.
+"""Post-process Xapyra captures: clean up hiss around and between speech.
 
-Mirrors the firmware DSP (HP 120Hz -> LP 5-6kHz -> presence -> FFT denoise
--> compressor -> loudnorm limiter) using ffmpeg filters, so existing
-recordings can be cleaned without re-recording. Needs only ffmpeg on PATH.
+WHAT THIS DOES AND DOES NOT DO -- read before trusting a number.
+
+Does: clean the noise floor in the gaps between words.
+    Measured on server/recordings/afterfix.mp3 (ffmpeg astats noise floor,
+    which is measured in genuinely quiet frames):
+        as-is .................. -51.3 dB
+        afftdn nr=45 nf=-35 .... -58.5 dB
+        afftdn x2 .............. -74.7 dB   <- what this tool applies
+
+Does NOT: remove hiss you hear *while* someone is talking.
+    Measured with a stricter metric (4-16kHz hiss relative to the 300-3400Hz
+    voice band, over speech frames only), the same file scores -14.6 dB before
+    and -13.6 dB after -- i.e. unchanged, within run-to-run variation. That
+    hiss is analogue preamp noise from the MAX4466 at maximum gain. It shares
+    time-frequency cells with the voice, so no filter separates it; the fix is
+    the preamp gain setting, not more DSP. See adcpeak in the device serial log.
 
 Usage:
-  python server/tools/enhance_voice.py server/recordings/xapyra-....mp3
-  python server/tools/enhance_voice.py --all
-  python server/tools/enhance_voice.py in.mp3 -o out_voice.mp3 [--strong]
+    python server/tools/enhance_voice.py FILE.mp3 [-o OUT.mp3]
+    python server/tools/enhance_voice.py --all
+    python server/tools/enhance_voice.py FILE.mp3 --strong
 """
 from __future__ import annotations
 
@@ -22,53 +35,70 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_IN = REPO / "server" / "recordings"
 
 
-def have_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-
 def build_filter(strong: bool) -> str:
-    nr = "afftdn=nr=25:nf=-30" if not strong else "afftdn=nr=30:nf=-25"
-    # HP 120 / LP 4.5k x2 (24dB/oct, poles max 2 per stage) / presence +8dB
-    # @3k / FFT denoise / gentle compressor / loudnorm to -16 LUFS speech
-    parts = [
+    """Voice band + spectral subtraction.
+
+    lowpass 3.4k x2 : keep the intelligibility band (300-3400Hz carries
+        almost all speech intelligibility) and drop everything above it, where
+        the preamp hiss lives. Cheap, and the only filter that measurably
+        moved the HF floor in testing (-40.5 -> -42.6 dB per 2 poles).
+    afftdn x2 : the actual white-noise killer. Pass 1 removes broadband
+        hiss, pass 2 cleans what pass 1 left behind. One pass alone gets
+        ~7dB; two passes get ~23dB. A single pass leaves audible residue.
+    """
+    nr, nf = (60, -35) if strong else (45, -35)
+    return ",".join([
         "highpass=f=120:poles=2",
-        "lowpass=f=4500:poles=2",
-        "lowpass=f=4500:poles=2",
-        "equalizer=f=3000:t=q:w=1:g=8",
-        nr,
-        "acompressor=threshold=-20dB:ratio=4:attack=10:release=200:makeup=8dB",
-        "loudnorm=I=-16:TP=-2:LRA=11",
-    ]
-    return ",".join(parts)
+        "lowpass=f=3400:poles=2",
+        "lowpass=f=3400:poles=2",
+        "equalizer=f=2500:t=q:w=1:g=4",
+        f"afftdn=nr={nr}:nf={nf}:tn=1",
+        f"afftdn=nr={nr}:nf={nf}:tn=1",
+        "alimiter=limit=0.95:attack=5:release=50",
+    ])
 
 
 def enhance(src: Path, dst: Path, strong: bool) -> None:
-    f = build_filter(strong)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(src), "-ac", "1", "-ar", "32000",
-        "-af", f, "-b:a", "128k", str(dst),
+        "-af", build_filter(strong), "-b:a", "128k", str(dst),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg failed for {src.name}:\n{r.stderr[-2000:]}")
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Clean Xapyra captures for voice.")
-    ap.add_argument("input", nargs="?", help="input mp3 (default: --all)")
+def noise_floor(path: Path) -> str:
+    """astats noise floor (quiet-frame level), printed so the result is
+    verifiable rather than vibes. This is the gap-between-words number, NOT
+    the hiss-during-speech number -- see the module docstring."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "info",
+        "-i", str(path),
+        "-af", "astats=measure_overall=Noise_floor:measure_perchannel=0",
+        "-f", "null", "NUL",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    for line in r.stderr.splitlines():
+        if "Noise floor dB:" in line:
+            return line.split("Noise floor dB:")[1].strip()
+    return "?"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Isolate voice in Xapyra captures.")
+    ap.add_argument("input", nargs="?", help="input mp3 (use --all for the whole dir)")
     ap.add_argument("-o", "--output", help="output mp3")
-    ap.add_argument("--all", action="store_true", help="process all recordings/")
-    ap.add_argument("--strong", action="store_true", help="stronger denoise")
-    ap.add_argument("--outdir", default="server/enhanced",
-                    help="output dir for --all (default: server/enhanced)")
+    ap.add_argument("--all", action="store_true", help="process every mp3 in server/recordings")
+    ap.add_argument("--strong", action="store_true", help="stronger spectral reduction")
+    ap.add_argument("--outdir", default="server/enhanced", help="output dir for --all")
     a = ap.parse_args(argv)
 
-    if not have_ffmpeg():
+    if shutil.which("ffmpeg") is None:
         print("ffmpeg not found on PATH.", file=sys.stderr)
         return 1
 
-    targets: list[Path] = []
     if a.all:
         targets = sorted(DEFAULT_IN.glob("*.mp3"))
         if not targets:
@@ -90,8 +120,11 @@ def main(argv=None) -> int:
         else:
             outdir.mkdir(parents=True, exist_ok=True)
             dst = outdir / f"{src.stem}_voice.mp3"
+        before = noise_floor(src)
         enhance(src, dst, a.strong)
+        after = noise_floor(dst)
         print(f"ok: {src.name} -> {dst}")
+        print(f"    noise floor {before} -> {after} dBFS")
     return 0
 
 

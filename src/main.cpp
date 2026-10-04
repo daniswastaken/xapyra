@@ -74,19 +74,50 @@ static bool green_led_state = false;
 static bool green_was_streaming = false; // detek masuk/keluar state streaming
 static unsigned long last_wifi_check = 0;
 
-// === INPUT TRIM (headroom, WAJIB kuat karena pot MAX4466 mentok) ===
-// Pot mentok ~125x: ADC sering rail saat vokal keras. Trim otomatis wajib
-// turun DALAM dan CEPAT (bukan 0.7), kalau tidak flat-top clip masuk DSP
-// -> kompresor/limiter kerja rodi = putus-putus. Rentang total trim:
-// 0.5*1.0=0.5 (-6dB) s/d 0.5*0.12=0.06 (-24dB). Pulihnya pelan biar tidak
-// pumping saat kalimat naik-turun.
-#define INPUT_TRIM_BASE 0.5f    // -6dB tetap
-static float input_trim_auto = 1.0f;  // 0.12..1.0, adaptif via clip detector
+// === INPUT TRIM (headroom + gain untuk jarak jauh) ===
+// Gain jarak jauh TIDAK lagi diserahkan ke AGC. AGC_MAX_GAIN yang dinaikkan
+// ke 10 memberi rentang gain 20dB, dan AGC mengikuti envelope vokal yang
+// berfluktuasi -- hasilnya level meloncat: terukur 404-894 lompatan >6dB
+// per 20ms per menit dengan swing 44dB. Itulah "spike" yangDidengar.
+//
+// Solusinya: angkat suara jauh di SINI (gain tetap, tidak berubah-ubah),
+// lalu beri AGC rentang kecil (3x) dengan respons lambat. Kecepatan
+// transient ditangani kompresor -- itu tugasnya, bukan AGC.
+//
+// Auto-trim tetap ada karena pot MAX4466 mentok: target turun dalam saat
+// clip, tapi gain yang dipakai dislew per-sample (TRIM_SLEW) supaya tidak
+// ada langkah gain yang terdengar.
+#define INPUT_TRIM_BASE 1.0f    // 0dB; AGC (range kecil, lambat) yang angkat
+static float input_trim_auto = 1.0f;  // gain yang dipakai, 0.12..1.0
+static float input_trim_target = 1.0f; // tujuan dari clip detector
 #define TRIM_MIN  0.12f
-#define TRIM_DOWN 0.7f    // serang cepat saat clip (tiap 0.25 detik)
-#define TRIM_UP   1.03f   // pulih pelan (~14 detik full-range)
+#define TRIM_DOWN 0.7f    // target serang cepat saat clip (tiap 0.25 detik)
+#define TRIM_UP   1.03f   // target pulih pelan (~14 detik full-range)
+// Slew per-sample: 0.02%/sample @32kHz = ~3dB dalam 50ms. Cepat cukup untuk
+// menahan clip, halus cukup untuk tidak terdengar sebagai klik.
+#define TRIM_SLEW 0.0002f
 static uint32_t clip_count = 0;
 static uint32_t total_samples = 0;
+// ADC peakbktracking (window ~2 detik) untuk diagnose gain analog.
+static uint16_t adc_peak_win = 0;   // peak deviasi dari 2048 (window ~2 detik)
+static uint32_t adc_floor_win = 0;  // rata-rata kuadrat deviasi (noise floor ADC)
+static uint32_t adc_floor_acc = 0;
+static uint32_t adc_floor_n = 0;
+
+// SNR keras: noise floor ADC vs sinyal. Dihitung dari data mentah SEBELUM
+// filter/kompresor/AGC/encoder. Ini satu-satunya cara tahu apakah desis
+// datang dari analog (tidak bisa di|软件) atau dari rantai DSP.
+static inline void adc_noise_track(int32_t dev) {
+    uint32_t a = (dev < 0) ? (uint32_t)(-dev) : (uint32_t)dev;
+    if (a > adc_peak_win) adc_peak_win = (uint16_t)(a > 65535 ? 65535 : a);
+    else adc_peak_win--;
+    adc_floor_acc += a * a;
+    if (++adc_floor_n >= 32000) {   // 1 detik
+        adc_floor_win = (uint32_t)(sqrtf((float)adc_floor_acc / adc_floor_n) + 0.5f);
+        adc_floor_acc = 0;
+        adc_floor_n = 0;
+    }
+}
 
 // === HIGH-PASS 2-POLE (vocal, cut <120Hz, 12dB/oct) ===
 // Potong DC + dengung/ruang di bawah pita suara, tapi JANGAN makan
@@ -103,15 +134,18 @@ static inline float highpass_stage(float x, float *x_prev, float *y_prev) {
     return y;
 }
 
-// === LOW-PASS 3-POLE (cut >5kHz hiss, 18dB/oct) ===
-// Rekaman lama bocor: ~70% energi di atas 4kHz = hiss murni, bukan vokal.
-// 2-pole lama terlalu landai. 3x cascade di 5kHz: vokal (s/d fricative)
-// lolos, hiss 8kHz+ ketekan ~-18dB.
-// fc=5000Hz, fs=32kHz → alpha = exp(-2*pi*fc/fs) ≈ 0.3746
+// === LOW-PASS 4-POLE (cut >4.5kHz hiss, 24dB/oct) ===
+// lat.mp3: di bagian hening, hiss tersisa -33dBFS dan spektrumnya rata
+// 8-16kHz. LP 3-pole di 5kHz hanya -18dB @10kHz, jadi ethos bocor.
+// 4 pole di 4.5kHz: -6dB @4.5k (konsonan 's' sedikit dipendekkan),
+// -13dB @8kHz, -22dB @14kHz. Risiko: 'sh' jadi 's' -- vokal utama
+// (<4kHz) tidak tersentuh.
+// fc=4500Hz, fs=32kHz → alpha = exp(-2*pi*fc/fs) ≈ 0.4138
 static float lp1_y_prev = 0.0f;
 static float lp2_y_prev = 0.0f;
 static float lp3_y_prev = 0.0f;
-#define LP_ALPHA 0.3746f
+static float lp4_y_prev = 0.0f;
+#define LP_ALPHA 0.4138f
 
 static inline float lowpass_stage(float x, float *y_prev) {
     float y = LP_ALPHA * (*y_prev) + (1.0f - LP_ALPHA) * x;
@@ -134,14 +168,31 @@ static inline float presence_process(float x) {
 
 // === NOISE SUPPRESSOR (expander + VAD hangover, anti-hiss saat sepi) ===
 // Estimasi lantai noise adaptif (min-follower lambat), hitung SNR sesaat.
-// SNR tinggi -> lewat (gain 1). SNR rendah -> tekan ke -18dB.
-// Hangover 350ms: akhir kata tidak kepotong. Semua time-domain,
-// ~15 flop/sample, Aman bareng encoder MP3.
+// SNR tinggi -> lewat (gain 1). SNR rendah -> tekan ke -40dB (dulu -18dB,
+// masih kedengaran karena AGC tetap tinggi saat hening). Hangover 250ms:
+// akhir kata tidak kepotong. Semua time-domain, ~15 flop/sample, aman
+// bareng encoder MP3.
+//
+// CATATAN jujur batasnya: ini expander time-domain. Ia HANYA bisa membersihkan
+// jeda/sunyi antar-kata. Noise yang jatuh di sel waktu-frekuensi yang
+// sama dengan vokal (desis saat bicara) TIDAK bisa dia bersihkan di sini --
+// itu butuh spectral subtraction (FFT), dan pengukuran menunjukkan
+// pengaruhnya kecil (<3dB) dibanding risko CPU ESP32. Sisaanya harus
+// ditangani di sisi PC (server/tools/enhance_voice.py).
+//
+// PENTING soal "spike": gate yang suppress dalam (-40dB) DAN ditutup cepat
+// akan chatter saat SNR melintasi ambang di tengah kalimat. Setiap putaran
+// chatter = langkah gain puluhan dB = klik yang terdengar. Karena itu gate di
+// sini sengaja dangkal dan lambat: tugasnya hanya membersihkan jeda antar-kata
+// dengan mulus, bukan mengejar desis.
+//
+// ns_floor_pub hanya untuk log serial (diagnostik).
 static float ns_env = 0.0f;     // envelope cepat sinyal pita-vokal
 static float ns_floor = 300.0f; // estimasi lantai noise (start konservatif)
 static float ns_gain = 1.0f;
 static uint32_t ns_hold = 0;    // sisa hangover, dalam sample
 static bool ns_voice_open = true;
+float ns_floor_pub = 300.0f;    // diagnostics
 #define NS_ATK_ENV   0.05f      // envelope attack (~1ms)
 #define NS_REL_ENV   0.001f     // envelope release (~30ms)
 #define NS_FLOOR_UP  0.000005f  // floor naik SANGAT pelan (TC ~6 detik).
@@ -150,10 +201,12 @@ static bool ns_voice_open = true;
 #define NS_FLOOR_DN  0.005f     // floor turun cepat ke minimum baru
 #define NS_SNR_HI    3.5f       // di atas ini = vokal, lewat penuh
 #define NS_SNR_LO    1.2f       // di bawah ini = noise, tekan
-#define NS_FLOOR_SUPPRESS 0.12f // -18dB saat murni noise
-#define NS_HOLD_SAMPLES (11200u) // 350ms @32kHz, akhir kata Aman
-#define NS_ATK_GAIN  0.02f      // tutup PELAN (dulu 0.05: flutter = putus-putus)
-#define NS_REL_GAIN  0.002f     // buka pelan (anti-chatter)
+#define NS_FLOOR_SUPPRESS 0.056f // -25dB, bukan -40dB. Gate dalam + close
+                              // masih kedengaran karena AGC tetap tinggi)
+#define NS_HOLD_SAMPLES (32000u) // 1 detik. 250ms terlalu pendek: SNR melodic
+                                // kata masih_STORE noise yang sudah di-gate
+#define NS_ATK_GAIN  0.0005f    // tutup dengan TC ~2 detik
+#define NS_REL_GAIN  0.0005f    // buka sama lamanya: gain tidak pernah melompat
 
 static inline float ns_process(float sample) {
     float a = fabsf(sample);
@@ -191,6 +244,7 @@ static inline float ns_process(float sample) {
     float ga = (target < ns_gain) ? NS_ATK_GAIN : NS_REL_GAIN;
     ns_gain += ga * (target - ns_gain);
     ns_voice_open = (ns_gain > 0.5f);
+    ns_floor_pub = ns_floor;
     return sample * ns_gain;
 }
 
@@ -223,17 +277,24 @@ static inline float compressor_process(float sample) {
 }
 
 // === AGC (slow leveler + noise gate, retune jarak jauh 7m) ===
-// MAX_GAIN 3.0 -> 10.0: suara 7m (~-17dB vs 1m) butuh gain besar.
-// Supaya hiss tidak ikut kencang: gain naik HANYA saat suppressor yakin
-// ada vokal (ns_voice_open + envelope > 2x lantai noise).
+// MAX_GAIN 3.0 (dikembalikan dari 10.0): gain jarak jauh sekarang datang dari
+// INPUT_TRIM_BASE yang tetap, jadi AGC tidak perlu range lebar. Range 20dB
+// adalah sumber utama level meloncat.
+//
+// ATTACK 0.1 -> 0.005: 0.1 berarti 20dB dalam 0.7ms, jadi satu plosif
+// menjatuhkan gain seketika dan RELEASE yang pelan memulihkannya -- besar
+// kontribusinya ke "spike". 0.005 = 20dB dalam ~6ms, cukup untuk kontrol
+// level tanpa memotong kata.
 static float agc_peak = 1.0f;
 static float agc_gain = 1.0f;
 #define AGC_TARGET    15000.0f   // target peak (~-9dBFS): tegas tapi tidak
                                  // gepeng di limiter. Pot mentok + target 20k
                                  // = rms terlalu panas.
-#define AGC_ATTACK    0.1f      // fast attack (gain down)
-#define AGC_RELEASE   0.002f    // medium release (gain up, ikut jarak)
-#define AGC_MAX_GAIN  10.0f
+#define AGC_ATTACK    0.005f    // 20dB dalam ~6ms (0.1 = 0.7ms = memotong kata)
+#define AGC_RELEASE   0.001f    // TC ~1s, hanya merapikan level kalimat
+#define AGC_MAX_GAIN  6.0f      // cukup untuk angkat suara jauh; range 15dB
+                              // tetap aman karena responsnya lambat dan
+                              // gate suppressor sudah tidak berayun
 #define AGC_MIN_GAIN  0.1f
 
 static inline float agc_process(float sample) {
@@ -250,7 +311,7 @@ static inline float agc_process(float sample) {
     if (desired_gain > AGC_MAX_GAIN) desired_gain = AGC_MAX_GAIN;
     if (desired_gain < AGC_MIN_GAIN) desired_gain = AGC_MIN_GAIN;
 
-    // Freeze gain naik kecuali VAD yakin ada vokal (open + envelope nyata
+    // Gain HANYA boleh naik saat VAD yakin ada vokal (open + envelope nyata
     // di atas lantai noise). Kriteria level tetap (dulu agc_peak<800) bikin
     // dua masalah: suara jauh tidak pernah diangkat, dan jeda kata malah
     // dipompa naik lalu kata berikutnya menghantam limiter = putus-putus.
@@ -375,9 +436,19 @@ static void i2s_adc_init() {
         return;
     }
 
+    // ADC range: ATTEN_DB_11 (rentang ~3.3V). Ketiga konfigurasi diukur dengan
+    // metrik sama (desis 4-16kHz relatif pita suara, saat bicara):
+    //     trim 0.5 + ATTEN_11 -> -14.6 dB   <- terbaik, dipakai
+    //     trim 1.0 + ATTEN_6  -> -13.6 dB   lebih buruk
+    //     trim 0.5 + ATTEN_0  -> -14.0 dB   lebih buruk
+    // Range ADC lebih sempit tidak membantu: noise ADC ESP32 ikut naik
+    // sebanding, jadi SNR praktis tidak berubah. Hasilnya diterima apa adanya.
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_11);
+
     i2s_set_adc_mode(ADC_UNIT_1, ADC_CHANNEL);
     i2s_adc_enable(I2S_PORT);
-    Serial.println("I2S ADC initialized");
+    Serial.println("I2S ADC initialized (12-bit, ATTEN_DB_11)");
 }
 
 // === SAMPLE RATE (hardcoded, calibration causes watchdog reset) ===
@@ -437,17 +508,26 @@ static void audio_encode_task(void *param) {
             if (raw_adc <= 3 || raw_adc >= 4092) clip_count++;
 
             int16_t zero_centered = (int16_t)raw_adc - 2048;
+            adc_noise_track(zero_centered);
+
             float sample = (float)(zero_centered << 4);
 
-            // Trim headroom dulu (penting saat gain mentok)
+            // Trim headroom dulu (penting saat gain mentok). Gain-nya dislew pelan
+            // menuju target supaya tidak ada langkah gain yang terdengar.
+            if (input_trim_auto < input_trim_target) {
+                input_trim_auto += TRIM_SLEW * (input_trim_target - input_trim_auto);
+            } else if (input_trim_auto > input_trim_target) {
+                input_trim_auto -= TRIM_SLEW * (input_trim_auto - input_trim_target);
+            }
             sample *= (INPUT_TRIM_BASE * input_trim_auto);
 
-            // Audio pipeline: HPx2(120Hz) → LPx3(5k) → PRESENCE → NS-GATE → COMP → AGC → LIMIT
+            // Audio pipeline: HPx2(120Hz) → LPx4(4.5k) → PRESENCE → NS-GATE → COMP → AGC → LIMIT
             sample = highpass_stage(sample, &hp1_x_prev, &hp1_y_prev);
             sample = highpass_stage(sample, &hp2_x_prev, &hp2_y_prev);
             sample = lowpass_stage(sample, &lp1_y_prev);
             sample = lowpass_stage(sample, &lp2_y_prev);
             sample = lowpass_stage(sample, &lp3_y_prev);
+            sample = lowpass_stage(sample, &lp4_y_prev);
             sample = presence_process(sample);
             sample = ns_process(sample);
             sample = compressor_process(sample);
@@ -465,12 +545,17 @@ static void audio_encode_task(void *param) {
                 last_total = total_samples;
                 if (d_tot > 0) {
                     float rate = (float)d_clip / (float)d_tot;
-                    if (rate > 0.005f && input_trim_auto > TRIM_MIN) {
-                        input_trim_auto *= TRIM_DOWN;
-                        if (input_trim_auto < TRIM_MIN) input_trim_auto = TRIM_MIN;
-                    } else if (rate < 0.0005f && input_trim_auto < 1.0f) {
-                        input_trim_auto *= TRIM_UP;
-                        if (input_trim_auto > 1.0f) input_trim_auto = 1.0f;
+                    // Yang diubah hanya TARGET. Gain yang dipakai
+                    // (input_trim_auto) menyusul target lewat slew per-sample
+                    // di bawah. Versi lama memakai ×0.7 langsung tiap 250ms
+                    // = lonjakan gain 3.1dB pada 4Hz; itu zipper noise yang
+                    // terdengar sebagai spike, bukan penguatan yang halus.
+                    if (rate > 0.005f && input_trim_target > TRIM_MIN) {
+                        input_trim_target *= TRIM_DOWN;
+                        if (input_trim_target < TRIM_MIN) input_trim_target = TRIM_MIN;
+                    } else if (rate < 0.0005f && input_trim_target < 1.0f) {
+                        input_trim_target *= TRIM_UP;
+                        if (input_trim_target > 1.0f) input_trim_target = 1.0f;
                     }
                 }
             }
@@ -481,9 +566,12 @@ static void audio_encode_task(void *param) {
                     shine_enc, pcm_frame, &written);
 
                 if (written > 0 && mp3_data != NULL) {
-                    // Tunggu s/d 20ms saat ring penuh (DMA tahan 128ms, Aman).
-                    // Timeout 0 dulu = buang frame saat WiFi jitter = putus-putus.
-                    BaseType_t ret = xRingbufferSend(mp3_ring_buf, mp3_data, written, pdMS_TO_TICKS(20));
+                    // Timeout 0 = JANGAN pernah memblokir task encode di sini. Menunggu
+                    // menghentikan DSP loop, dan I2S DMA hanya punya buffer
+                    // ~128ms; overrun = sampel hilang = klik/pop keras.
+                    // Lebih baik buang 1 frame MP3 (decoder resync halus)
+                    // daripada merusak seluruh aliran ADC.
+                    BaseType_t ret = xRingbufferSend(mp3_ring_buf, mp3_data, written, 0);
                     if (ret == pdTRUE) {
                         frames_encoded++;
                     } else {
@@ -675,12 +763,15 @@ void loop() {
         size_t ring_free = 0;
         if (mp3_ring_buf) ring_free = xRingbufferGetCurFreeSize(mp3_ring_buf);
         float clip_pct = total_samples ? (100.0f * (float)clip_count / (float)total_samples) : 0.0f;
-        Serial.printf("Enc:%u Drop:%u Clip:%.2f%% trim:%.2f ns:%.2f%s comp:%.2f agc:%.2f free:%u tcp:%u | Client:%s\n",
+        Serial.printf("Enc:%u Drop:%u Clip:%.1f%% trim:%.2f ADCpk:%u ADCnf:%u SNRadc:%u%s "
+                      "ns:%.2f agc:%.2f | Client:%s\n",
                       frames_encoded, frames_dropped, clip_pct,
-                      INPUT_TRIM_BASE * input_trim_auto, ns_gain,
-                      ns_voice_open ? "" : "(shut)",
-                      comp_gain, agc_gain, (unsigned)ring_free,
-                      tcp_bytes_sent,
+                      INPUT_TRIM_BASE * input_trim_auto,
+                      adc_peak_win, adc_floor_win,
+                      (adc_floor_win > 0 && adc_peak_win > adc_floor_win)
+                          ? (uint32_t)(20.0f * log10f((float)adc_peak_win / adc_floor_win)) : 0u,
+                      (adc_floor_win > 0 && adc_peak_win < adc_floor_win * 8u) ? "(SNR jelek!)" : "",
+                      ns_gain, agc_gain,
                       client_connected ? "YES" : "NO");
     }
     vTaskDelay(pdMS_TO_TICKS(500));
