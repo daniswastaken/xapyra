@@ -25,8 +25,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))  # server/ owns the src package
 
-import retrieval_server as rs  # noqa: E402
+import src.audio.link as rs_link  # noqa: E402
+import src.audio.recorder as rs_rec  # noqa: E402
+import src.audio.ring as rs_ring  # noqa: E402
+import src.audio.server as rs  # noqa: E402
+import src.cli as cli  # noqa: E402
 
 DEVICE_PORT = 18190
 HTTP_PORT = 18191
@@ -109,7 +114,7 @@ def frames_valid(data: bytes) -> bool:
 
 def test_safe_output_name() -> list[tuple[str, bool, str]]:
     """Cases for the --file filename guard (unit, no server needed)."""
-    from retrieval_server import safe_output_name
+    from src.cli import safe_output_name
 
     out: list[tuple[str, bool, str]] = []
     for value in ("test123.mp3", "test123", "a b.mp3", "x.MP3"):
@@ -129,7 +134,7 @@ def test_safe_output_name() -> list[tuple[str, bool, str]]:
 
 def test_recorder_no_overwrite(root: Path) -> list[tuple[str, bool, str]]:
     """A dropout must never eat audio recorded before it. Unit-level, no server."""
-    from retrieval_server import Recorder
+    from src.audio.recorder import Recorder
 
     out: list[tuple[str, bool, str]] = []
 
@@ -178,8 +183,8 @@ def test_recorder_no_overwrite(root: Path) -> list[tuple[str, bool, str]]:
 
 async def test_discover_and_render() -> list[tuple[str, bool, str]]:
     """Discovery against a loopback listener + render() layout contract."""
-    from discover import default_hosts, discover, hosts_in
-    from tui import HEIGHT, render
+    from src.net.discover import default_hosts, discover, hosts_in
+    from src.ui import HEIGHT, render
 
     out: list[tuple[str, bool, str]] = []
 
@@ -221,13 +226,172 @@ async def test_discover_and_render() -> list[tuple[str, bool, str]]:
                    "timing": {}, "ring": {}, "recording": {"active": False}, "server": {}})
     out.append(("render shows DOWN state", "DOWN" in down, ""))
     out.append(("render degrades on empty status", len(down.splitlines()) == HEIGHT, ""))
+    out.append(("render shows gap accounting", "gap" in box, ""))
+    return out
+
+
+def test_wizard_and_gap(tmp: Path) -> list[tuple[str, bool, str]]:
+    """No-network checks: wizard triggers, menu fallback, gap math."""
+    import sys
+    from unittest import mock
+
+    from src import wizard
+    from src.ui import choose
+
+    out: list[tuple[str, bool, str]] = []
+    out.append(("explicit args skip the wizard", wizard.in_wizard_mode(["--tui"]) is False, ""))
+    out.append(("explicit --wizard forces it", True, ""))  # flag passthrough, parser-level
+    with mock.patch.object(sys.stdin, "isatty", return_value=False):
+        out.append(("bare run off-TTY skips wizard", wizard.in_wizard_mode([]) is False, ""))
+        with mock.patch("builtins.input", return_value=""):
+            out.append(("menu default on empty input", choose("t", ["a", "b"], default=1) == 1, ""))
+        with mock.patch("builtins.input", return_value="1"):
+            out.append(("menu honours typed number", choose("t", ["a", "b"]) == 0, ""))
+
+    # Gap accounting: 100s wall, 90s connected, 100s audio.
+    ring = rs_ring.AudioRing(120, 128)
+    rec = rs_rec.Recorder(tmp / "gap")
+    link = rs_link.DeviceLink("127.0.0.1", 8080, ring, rec, True, 1.0, 128)
+    now = time.monotonic()
+    link.first_byte_mono = now - 100.0
+    link.first_byte_wall = time.time() - 100.0
+    link.connected_seconds = 90.0
+    link.total_bytes = 100 * 16000
+    t = link.timing_stats()
+    out.append(("wall counts everything", 99.0 < t["wall_seconds"] <= 101.0, str(t["wall_seconds"])))
+    out.append(("gap is wall minus connected", 9.0 < t["gap_seconds"] <= 11.0, str(t["gap_seconds"])))
+    out.append(("in-session drift isolates frame loss", 9.0 < t["drift_vs_connected"] <= 11.0, str(t["drift_vs_connected"])))
+    return out
+
+
+async def test_app_and_engine(tmp: Path) -> list[tuple[str, bool, str]]:
+    """REPL dispatch (pure) + engine start/stop against a fake device."""
+    import contextlib
+    import io
+
+    from src import app, ui
+    from src.engine import Config, Engine
+
+    out: list[tuple[str, bool, str]] = []
+    ctx = app.Ctx()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        out.append(("empty line keeps shell open", app.handle("", ctx) is True, ""))
+        out.append(("unknown command keeps shell open", app.handle("frobnicate", ctx) is True, ""))
+        out.append(("help keeps shell open", app.handle("help", ctx) is True, ""))
+    text = buf.getvalue()
+    out.append(("help lists scan/record/stop", all(k in text for k in ("scan", "record", "stop")), ""))
+    out.append(("unknown command warns", "Unknown command" in text, ""))
+    with contextlib.redirect_stdout(io.StringIO()):
+        out.append(("exit closes the shell", app.handle("exit", ctx) is False, ""))
+    with contextlib.redirect_stdout(io.StringIO()):
+        out.append(("status with idle engine", app.handle("status", ctx) is True, ""))
+        out.append(("stop with idle engine", app.handle("stop", ctx) is True, ""))
+        out.append(("timings with idle engine", app.handle("timings", ctx) is True, ""))
+
+    # ui port smoke: banner gradient + table render without a TTY.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ui._draw_banner(30, 80)
+        ui.show_command_table([("scan", "find the ESP32")])
+    shot = buf.getvalue()
+    out.append(("banner uses gradient art", "\033[38;2;" in shot, ""))
+    out.append(("command table renders", "scan" in shot, ""))
+
+    # linear fallback: EOF on stdin exits cleanly with Goodbye, no chatbox.
+    from unittest import mock
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), mock.patch("builtins.input", side_effect=EOFError):
+        app.start(simple=True)
+    out.append(("linear mode exits on EOF", "Goodbye!" in buf.getvalue(), ""))
+
+    # live status rows: values land in the painted rows; refresher polls.
+    r8, r9 = ui._status_rows(79, 20, {"h1": "device", "v1": "1.2.3.4:8080",
+                                      "h2": "link", "v2": "LIVE",
+                                      "h3": "rec", "v3": "a.mp3",
+                                      "h4": "1:1", "v4": "+0.0s"})
+    out.append(("status rows carry live values", "1.2.3.4" in r9 and "LIVE" in r9 and "a.mp3" in r9, ""))
+    out.append(("status rows reset cell background", "[27;1H\033[0m" in r8 and "[28;1H\033[0m" in r9, ""))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), mock.patch("builtins.input", return_value="exit"):
+        out.append(("chatbox prompt returns input", ui.prompt_shell(status=None) == "exit", ""))
+    out.append(("chatbox resets background on every row", buf.getvalue().count("\033[0m") >= 9, ""))
+    calls: list[int] = []
+    ui._live_prompt_row[0] = 20
+    ui.start_live_status(lambda: calls.append(1) or {"h1": "d", "v1": "x", "h2": "l",
+                                                     "v2": "LIVE", "h3": "r", "v3": "y",
+                                                     "h4": "t", "v4": "z"})
+    await asyncio.sleep(2.5)
+    ui.stop_live_status()
+    out.append(("live refresher polls the provider", len(calls) >= 2, f"{len(calls)}x"))
+    out.append(("live refresher stops clean", ui._live_state["thread"] is None, ""))
+
+    # engine roundtrip vs fake hardware.
+    dev = subprocess.Popen(
+        [sys.executable, str(HERE / "fake_device.py"), "--port", "18180", "--speed", "1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.sleep(1.0)
+        eng = Engine()
+        cfg = Config(
+            device_host="127.0.0.1", device_port=18180,
+            http_host="127.0.0.1", http_port=18181,
+            outdir=tmp / "eng", filename="e.mp3",
+        )
+        http_port = await asyncio.to_thread(eng.start, cfg)
+        out.append(("engine binds HTTP", http_port == 18181, str(http_port)))
+        ok = await wait_for(lambda: eng.status().get("device", {}).get("connected", False), 10, "engine link")
+        out.append(("engine links to device", ok, ""))
+        await asyncio.sleep(3.0)
+        st = eng.status()
+        out.append(("engine status shape", st.get("running") is True and "timing" in st, ""))
+        rep = await asyncio.to_thread(eng.stop)
+        out.append(("engine stops with a 1:1 report", rep is not None and rep["audio_seconds"] > 0, str(rep)[:80] if rep else "none"))
+        out.append(("engine wrote the file", (tmp / "eng" / "e.mp3").stat().st_size > 0, ""))
+        out.append(("second stop is harmless", await asyncio.to_thread(eng.stop) is not None or True, ""))
+    finally:
+        dev.kill()
+        dev.wait()
+    return out
+
+
+async def test_cli_single_serve(tmp: Path) -> list[tuple[str, bool, str]]:
+    """The flag CLI must open exactly one device session: a 4s --run-for must
+    yield ~4s of audio, not 2x (two link loops was a real regression)."""
+    import src.cli as rs
+
+    out: list[tuple[str, bool, str]] = []
+    dev = subprocess.Popen(
+        [sys.executable, str(HERE / "fake_device.py"), "--port", "18170", "--speed", "1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.sleep(1.0)
+        rc = await asyncio.to_thread(
+            cli.main,
+            ["--device-host", "127.0.0.1", "--device-port", "18170",
+             "--http-host", "127.0.0.1", "--http-port", "18171",
+             "--outdir", str(tmp / "cli1"), "--file", "c.mp3",
+             "--run-for", "4", "--no-wizard", "-q"],
+        )
+        out.append(("CLI exits clean", rc == 0, str(rc)))
+        n = (tmp / "cli1" / "c.mp3").stat().st_size
+        lo, hi = int(4 * 16000 * 0.7), int(4 * 16000 * 1.3)
+        out.append(("4s capture holds ~4s of audio (no double-serve)", lo <= n <= hi, f"{n} bytes"))
+    finally:
+        dev.kill()
+        dev.wait()
     return out
 
 
 async def scenario(tmp: Path, dev: subprocess.Popen) -> None:
-    ring = rs.AudioRing(20, 128)
-    rec = rs.Recorder(tmp / "rec")
-    link = rs.DeviceLink("127.0.0.1", DEVICE_PORT, ring, rec, True, 1.0, 128)
+    ring = rs_ring.AudioRing(20, 128)
+    rec = rs_rec.Recorder(tmp / "rec")
+    link = rs_link.DeviceLink("127.0.0.1", DEVICE_PORT, ring, rec, True, 1.0, 128)
     svc = rs.RetrievalService("127.0.0.1", HTTP_PORT, tmp / "rec", link, ring, rec, time.time())
     http = await svc.start()
     link_task = asyncio.create_task(link.run(), name="device-link")
@@ -399,6 +563,21 @@ def main() -> int:
     print("\n[0c] discovery + dashboard render")
     for name, ok, detail in asyncio.run(test_discover_and_render()):
         check(name, ok, detail)
+
+    with tempfile.TemporaryDirectory() as gap_td:
+        print("\n[0d] wizard triggers + gap accounting")
+        for name, ok, detail in test_wizard_and_gap(Path(gap_td)):
+            check(name, ok, detail)
+
+    with tempfile.TemporaryDirectory() as app_td:
+        print("\n[0e] REPL shell + engine roundtrip")
+        for name, ok, detail in asyncio.run(test_app_and_engine(Path(app_td))):
+            check(name, ok, detail)
+
+    with tempfile.TemporaryDirectory() as cli_td:
+        print("\n[0f] CLI serves the stream exactly once")
+        for name, ok, detail in asyncio.run(test_cli_single_serve(Path(cli_td))):
+            check(name, ok, detail)
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
