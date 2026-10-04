@@ -131,16 +131,33 @@ class Recorder:
         self.path: Path | None = None
         self.started_at: float | None = None
         self.bytes_written = 0
+        self.total_written = 0
 
     def start(self) -> None:
         if self._fh is not None:
             return
         if self._filename is not None:
             self.path = self._outdir / self._filename
+            if not self._opened_once and self.path.is_file() and self.path.stat().st_size > 0:
+                # Server restart with --file: the old capture is real audio.
+                # Move it aside instead of truncating it into oblivion.
+                backup = self.path.with_name(
+                    f"{self.path.stem}-{datetime.now():%Y%m%d-%H%M%S}.bak{self.path.suffix}"
+                )
+                self.path.rename(backup)
+                LOG.info("previous capture preserved as %s", backup)
             # First open of this server run starts clean; reconnects append.
             mode = "ab" if self._opened_once else "wb"
         else:
-            self.path = self._outdir / f"xapyra-{datetime.now():%Y%m%d-%H%M%S}.mp3"
+            # Timestamps only have 1s resolution; a fast drop+reconnect can
+            # land in the same second and truncate the previous session file.
+            # Never reuse a name that already exists on disk.
+            base = f"xapyra-{datetime.now():%Y%m%d-%H%M%S}"
+            self.path = self._outdir / f"{base}.mp3"
+            n = 2
+            while self.path.exists():
+                self.path = self._outdir / f"{base}-{n}.mp3"
+                n += 1
             mode = "wb"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.started_at = time.time()
@@ -154,6 +171,7 @@ class Recorder:
             return
         self._fh.write(data)
         self.bytes_written += len(data)
+        self.total_written += len(data)
 
     def stop(self) -> None:
         if self._fh is None:
@@ -166,11 +184,17 @@ class Recorder:
         self._fh = None
 
     def stats(self) -> dict:
+        file_bytes = None
+        if self.path is not None and self.path.is_file():
+            with contextlib.suppress(OSError):
+                file_bytes = self.path.stat().st_size
         return {
             "active": self._fh is not None,
             "path": self.path.name if self.path else None,
             "started_at": iso(self.started_at),
             "bytes_written": self.bytes_written,
+            "total_written": self.total_written,
+            "file_bytes": file_bytes,
         }
 
 
@@ -746,9 +770,26 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     dev = p.add_argument_group("device (ESP32 TCP server)")
-    dev.add_argument("--device-host", default=env("XAPYRA_DEVICE_HOST", "127.0.0.1"), help="ESP32 IP or hostname")
+    dev.add_argument(
+        "--device-host",
+        default=env("XAPYRA_DEVICE_HOST", "127.0.0.1"),
+        help="ESP32 IP, hostname, or 'auto' to scan the local network for port 8080",
+    )
     dev.add_argument("--device-port", type=int, default=int(env("XAPYRA_DEVICE_PORT", "8080")), help="ESP32 TCP port")
     dev.add_argument("--reconnect-max", type=float, default=10.0, help="max seconds between reconnect attempts")
+    dev.add_argument(
+        "--scan-subnet",
+        action="append",
+        default=None,
+        metavar="CIDR",
+        help="limit 'auto' discovery to this subnet (repeatable, /24 or smaller). Default: every local /24",
+    )
+    dev.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=float(env("XAPYRA_SCAN_TIMEOUT", "0.4")),
+        help="per-host connect timeout in seconds for 'auto' discovery",
+    )
     h = p.add_argument_group("http server")
     h.add_argument("--http-host", default=env("XAPYRA_HTTP_HOST", "0.0.0.0"), help="bind address")
     h.add_argument("--http-port", type=int, default=int(env("XAPYRA_HTTP_PORT", "8081")), help="bind port (0 = pick a free one)")
@@ -772,6 +813,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-v", "--verbose", action="count", default=0, help="-v for request logs, -vv for debug")
     p.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
+    p.add_argument(
+        "--tui",
+        action="store_true",
+        help="live terminal dashboard (betterVpack-style) instead of log lines",
+    )
     return p
 
 
@@ -800,6 +846,21 @@ def safe_output_name(name: str) -> str:
 
 
 async def amain(args: argparse.Namespace) -> int:
+    from discover import discover_one
+    from tui import dashboard
+    from tui import message as say
+
+    if args.device_host.lower() == "auto":
+        found = await discover_one(
+            args.device_port, subnets=args.scan_subnet, timeout=args.scan_timeout
+        )
+        if found is None:
+            say("no device answering on port "
+                f"{args.device_port} -- is the ESP32 on the same network?", 4)
+            return 2
+        say(f"ESP32 found at {found}", 2)
+        args.device_host = found
+
     ring = AudioRing(args.retention, args.bitrate_kbps)
     filename = args.file
     recorder = Recorder(args.outdir, filename)
@@ -827,6 +888,14 @@ async def amain(args: argparse.Namespace) -> int:
         with contextlib.suppress(NotImplementedError, AttributeError, ValueError):
             loop.add_signal_handler(sig, stop.set)
 
+    tui_task = None
+    if args.tui:
+        if not args.quiet and args.verbose == 0:
+            # Dashboard owns the screen; INFO log lines would tear it up.
+            logging.getLogger().setLevel(logging.WARNING)
+            say("live dashboard -- Ctrl+C quits", 1)
+        tui_task = asyncio.create_task(dashboard(link, port, stop), name="tui")
+
     run_for_task = None
     if args.run_for and args.run_for > 0:
         LOG.info("1:1 test: will stop %.1fs after the first audio byte", args.run_for)
@@ -835,10 +904,11 @@ async def amain(args: argparse.Namespace) -> int:
     await stop.wait()
     LOG.info("shutting down")
     link.close()
-    if run_for_task is not None:
-        run_for_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await run_for_task
+    for task in (tui_task, run_for_task):
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     device_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await device_task
@@ -889,6 +959,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.run_for < 0:
         LOG.error("--run-for must be >= 0")
+        return 2
+    if args.scan_timeout <= 0:
+        LOG.error("--scan-timeout must be > 0")
         return 2
     if args.file is not None:  # not `if args.file` -- "" must also be validated
         try:

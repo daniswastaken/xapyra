@@ -20,6 +20,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -123,6 +124,103 @@ def test_safe_output_name() -> list[tuple[str, bool, str]]:
             out.append((f"--file {value!r} rejected", False, "accepted a path"))
         except ValueError:
             out.append((f"--file {value!r} rejected", True, ""))
+    return out
+
+
+def test_recorder_no_overwrite(root: Path) -> list[tuple[str, bool, str]]:
+    """A dropout must never eat audio recorded before it. Unit-level, no server."""
+    from retrieval_server import Recorder
+
+    out: list[tuple[str, bool, str]] = []
+
+    # 1. Timestamped mode: second session starting in the same wall second as
+    # the first must not reuse (and truncate) the first session's file.
+    d1 = root / "ts"
+    d1.mkdir(parents=True, exist_ok=True)
+    stamp = f"xapyra-{datetime.now():%Y%m%d-%H%M%S}.mp3"
+    (d1 / stamp).write_bytes(b"OLD")
+    r = Recorder(d1)
+    r.start()
+    r.write(b"NEW" * 100)
+    p = r.path
+    r.stop()
+    out.append(("same-second session never reuses a filename", p is not None and p.name != stamp, str(p)))
+    out.append(("previous session file untouched", (d1 / stamp).read_bytes() == b"OLD", stamp))
+    out.append(("new session content intact", p is not None and p.read_bytes() == b"NEW" * 100, str(p)))
+
+    # 2. --file mode: stop + start in one server run (i.e. a reconnect) appends.
+    d2 = root / "fixed"
+    r2 = Recorder(d2, "cap.mp3")
+    r2.start()
+    r2.write(b"A" * 1000)
+    r2.stop()
+    r2.start()
+    r2.write(b"B" * 1000)
+    r2.stop()
+    data = (d2 / "cap.mp3").read_bytes()
+    out.append(("--file reconnect appends, pre-drop audio kept", data == b"A" * 1000 + b"B" * 1000, f"{len(data)} bytes"))
+
+    # 3. --file mode: a fresh server process must not truncate yesterday's file.
+    r3 = Recorder(d2, "cap.mp3")
+    r3.start()
+    r3.write(b"C" * 500)
+    r3.stop()
+    fresh = (d2 / "cap.mp3").read_bytes()
+    baks = [b for b in d2.glob("cap-*.bak.mp3") if b.is_file()]
+    out.append((
+        "--file restart preserves old capture as backup",
+        len(baks) == 1 and baks[0].read_bytes() == b"A" * 1000 + b"B" * 1000,
+        str([b.name for b in baks]),
+    ))
+    out.append(("--file restart starts a fresh file", fresh == b"C" * 500, f"{len(fresh)} bytes"))
+    return out
+
+
+async def test_discover_and_render() -> list[tuple[str, bool, str]]:
+    """Discovery against a loopback listener + render() layout contract."""
+    from discover import default_hosts, discover, hosts_in
+    from tui import HEIGHT, render
+
+    out: list[tuple[str, bool, str]] = []
+
+    async def sink(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.close()
+
+    srv = await asyncio.start_server(sink, "127.0.0.1", 18193)
+    try:
+        found = await discover(18193, hosts=["127.0.0.1", "127.0.0.2"], timeout=0.5)
+        out.append(("discover finds the open port", found == ["127.0.0.1"], str(found)))
+        found = await discover(18194, hosts=["127.0.0.1"], timeout=0.5)
+        out.append(("discover reports nothing when closed", found == [], str(found)))
+    finally:
+        srv.close()
+
+    try:
+        hosts_in("10.0.0.0/16")
+        out.append(("scan refuses subnets larger than /24", False, "no error raised"))
+    except ValueError:
+        out.append(("scan refuses subnets larger than /24", True, ""))
+    out.append(("/24 expands to hosts", hosts_in("192.168.137.0/24")[0] == "192.168.137.1", ""))
+    out.append(("default_hosts excludes loopback", all(not h.startswith("127.") for h in default_hosts()), ""))
+
+    live = {
+        "device": {"host": "192.168.137.156", "port": 8080, "connected": True,
+                   "sessions": 2, "total_bytes": 1234567, "last_error": None},
+        "timing": {"wall_seconds": 40.2, "audio_seconds": 40.0, "drift_seconds": -0.2,
+                   "observed_bytes_per_sec": 15920.0},
+        "ring": {"retention_seconds": 120, "buffered_seconds": 12.4},
+        "recording": {"active": True, "path": "test123.mp3", "bytes_written": 640123,
+                      "file_bytes": 640123},
+        "server": {"port": 8081},
+    }
+    box = render(live)
+    out.append(("render is fixed height", len(box.splitlines()) == HEIGHT, f"{len(box.splitlines())} lines"))
+    for needle in ("192.168.137.156", "LIVE", "test123.mp3", "1,234,567", "drift", "8081"):
+        out.append((f"render shows {needle}", needle in box, ""))
+    down = render({"device": {"connected": False, "host": "?", "port": 8080},
+                   "timing": {}, "ring": {}, "recording": {"active": False}, "server": {}})
+    out.append(("render shows DOWN state", "DOWN" in down, ""))
+    out.append(("render degrades on empty status", len(down.splitlines()) == HEIGHT, ""))
     return out
 
 
@@ -291,6 +389,15 @@ def main() -> int:
     print(f"Xapyra retrieval server checks\npython {sys.version.split()[0]}")
     print("\n[0] --file filename guard")
     for name, ok, detail in test_safe_output_name():
+        check(name, ok, detail)
+
+    with tempfile.TemporaryDirectory() as unit_td:
+        print("\n[0b] recorder never overwrites prior audio")
+        for name, ok, detail in test_recorder_no_overwrite(Path(unit_td)):
+            check(name, ok, detail)
+
+    print("\n[0c] discovery + dashboard render")
+    for name, ok, detail in asyncio.run(test_discover_and_render()):
         check(name, ok, detail)
 
     with tempfile.TemporaryDirectory() as td:
