@@ -11,7 +11,12 @@ server/capture/
 server/t1/
 server/t2/
 server/t3/
+server/tauto/
 server/align/
 server/out*/
 *.mp3
 __pycache__/
+
+# opencode tool logs (the loop *.json session files predate this rule
+# and are still tracked)
+.opencode/opencode-loop/loop.log
