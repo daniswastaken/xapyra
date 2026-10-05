@@ -88,11 +88,14 @@ static unsigned long last_wifi_check = 0;
 // clip, tapi gain yang dipakai dislew per-sample (TRIM_SLEW) supaya tidak
 // ada langkah gain yang terdengar.
 #define INPUT_TRIM_BASE 1.0f    // 0dB; AGC (range kecil, lambat) yang angkat
-static float input_trim_auto = 1.0f;  // gain yang dipakai, 0.12..1.0
+static float input_trim_auto = 1.0f;  // gain yang dipakai, 0.25..1.0
 static float input_trim_target = 1.0f; // tujuan dari clip detector
-#define TRIM_MIN  0.12f
+#define TRIM_MIN  0.25f
 #define TRIM_DOWN 0.7f    // target serang cepat saat clip (tiap 0.25 detik)
-#define TRIM_UP   1.03f   // target pulih pelan (~14 detik full-range)
+#define TRIM_UP   1.08f   // pulih ~5 detik full-range. 1.03 butuh ~18 detik:
+                          // satu teriakan mengubur rekaman dalam desis
+                          // pompa-AGC lama setelahnya (lihat log trim 0.12
+                          // + agc 6.00 di afterfixagain.mp3).
 // Slew per-sample: 0.02%/sample @32kHz = ~3dB dalam 50ms. Cepat cukup untuk
 // menahan clip, halus cukup untuk tidak terdengar sebagai klik.
 #define TRIM_SLEW 0.0002f
@@ -192,6 +195,9 @@ static float ns_floor = 300.0f; // estimasi lantai noise (start konservatif)
 static float ns_gain = 1.0f;
 static uint32_t ns_hold = 0;    // sisa hangover, dalam sample
 static bool ns_voice_open = true;
+static bool ns_snr_voiced = false; // VAD mentah dari SNR sesaat (tanpa hold/gain),
+                                   // dipakai AGC supaya gain dibekukan tepat saat
+                                   // bicara berhenti, bukan 1 detik kemudian.
 float ns_floor_pub = 300.0f;    // diagnostics
 #define NS_ATK_ENV   0.05f      // envelope attack (~1ms)
 #define NS_REL_ENV   0.001f     // envelope release (~30ms)
@@ -201,12 +207,12 @@ float ns_floor_pub = 300.0f;    // diagnostics
 #define NS_FLOOR_DN  0.005f     // floor turun cepat ke minimum baru
 #define NS_SNR_HI    3.5f       // di atas ini = vokal, lewat penuh
 #define NS_SNR_LO    1.2f       // di bawah ini = noise, tekan
-#define NS_FLOOR_SUPPRESS 0.056f // -25dB, bukan -40dB. Gate dalam + close
-                              // masih kedengaran karena AGC tetap tinggi)
-#define NS_HOLD_SAMPLES (32000u) // 1 detik. 250ms terlalu pendek: SNR melodic
-                                // kata masih_STORE noise yang sudah di-gate
-#define NS_ATK_GAIN  0.0005f    // tutup dengan TC ~2 detik
-#define NS_REL_GAIN  0.0005f    // buka sama lamanya: gain tidak pernah melompat
+#define NS_FLOOR_SUPPRESS 0.01f // -40dB. Gate duduk SETELAH presence (+6dB)
+                              // tapi SEBELUM comp+AGC (sisa gain s/d +15dB):
+#define NS_HOLD_SAMPLES (9600u) // 300ms. 1 detik menahan desis terlalu lama
+                                // tiap jeda kata; 300ms lindungi akhir kata
+#define NS_ATK_GAIN  0.001f    // tutup ~90ms: fade-out halus, tanpa klik
+#define NS_REL_GAIN  0.01f     // buka ~10ms: onset kata tidak kepotong.
 
 static inline float ns_process(float sample) {
     float a = fabsf(sample);
@@ -223,6 +229,11 @@ static inline float ns_process(float sample) {
     if (ns_floor > 5000.0f) ns_floor = 5000.0f;
 
     float snr = ns_env / (ns_floor + 1.0f);
+    // VAD mentah untuk AGC: histeresis pada SNR sesaat, TANPA hold dan TANPA
+    // ns_gain yang dihaluskan. Hold+gain menahan flag sampai 1 detik setelah
+    // bicara berhenti -> AGC sempat memompa desis naik sebelum gate menutup.
+    if (snr >= NS_SNR_HI) ns_snr_voiced = true;
+    else if (snr <= NS_SNR_LO) ns_snr_voiced = false;
     float target;
     if (snr >= NS_SNR_HI) {
         target = 1.0f;
@@ -311,11 +322,10 @@ static inline float agc_process(float sample) {
     if (desired_gain > AGC_MAX_GAIN) desired_gain = AGC_MAX_GAIN;
     if (desired_gain < AGC_MIN_GAIN) desired_gain = AGC_MIN_GAIN;
 
-    // Gain HANYA boleh naik saat VAD yakin ada vokal (open + envelope nyata
-    // di atas lantai noise). Kriteria level tetap (dulu agc_peak<800) bikin
-    // dua masalah: suara jauh tidak pernah diangkat, dan jeda kata malah
-    // dipompa naik lalu kata berikutnya menghantam limiter = putus-putus.
-    bool voiced = ns_voice_open && (ns_env > ns_floor * 2.0f);
+    // Gain HANYA boleh naik saat VAD mentah yakin ada vokal (histeresis SNR,
+    // tanpa hold). Versi lama pakai ns_voice_open (ns_gain yang dihaluskan +
+    // hold 1 detik): flag telat turun -> AGC memompa desis tiap jeda kata.
+    bool voiced = ns_snr_voiced && (ns_env > ns_floor * 2.0f);
     if (!voiced && desired_gain > agc_gain) {
         desired_gain = agc_gain;
     }
@@ -535,7 +545,7 @@ static void audio_encode_task(void *param) {
             pcm_frame[pcm_pos++] = limiter_softclip(sample);
 
             // Auto-trim 4x/detik: clip >0.5% potong cepat (x0.7), sepi naik
-            // pelan (x1.03). Dalam s/d 0.12: pot mentok butuh itu.
+            // (x1.08, ~5 detik full-range). Dalam s/d 0.25: pot mentok butuh itu.
             if (total_samples % 8000 == 0) {
                 static uint32_t last_clip = 0;
                 static uint32_t last_total = 0;
