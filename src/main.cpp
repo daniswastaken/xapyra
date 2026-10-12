@@ -25,15 +25,15 @@ extern "C" {
 // Pakai LEDC supaya bisa dimorph via duty cycle, tanpa software ISR.
 // 5kHz: jauh di atas batas kedip mata/kamera, dan Aman untuk audio
 // (I2S + encoder jalan terus, PWM tak boleh jadi sumber desis).
-#define LED_PWM_FREQ        5000
-#define LED_PWM_BITS        8
-#define LED_PWM_MAX         ((1 << LED_PWM_BITS) - 1)   // 255 == duty penuh
+#define LED_PWM_FREQ        4000
+#define LED_PWM_BITS        14
+#define LED_PWM_MAX         ((1 << LED_PWM_BITS) - 1)   // 16383 == duty penuh
 
-// Brightness relatif 0..255. Turunin = redup.
-// Hijau kelihatan lebih terang dari merah pada arus sama, jadi
-// nilainya dibedain sedikit.
-#define LED_BRIGHT_RED      25    // ~10%
-#define LED_BRIGHT_GREEN    30    // ~12%
+// Brightness = raw duty count 0..LED_PWM_MAX. 9/16383 = 4.5/8191 (~0.055%),
+// persis tengah antara duty 4 dan 5 di 13-bit. 14-bit butuh freq <=4882Hz
+// (80MHz/16384), makanya freq turun 5k->4kHz. Masih jauh di atas flicker.
+#define LED_BRIGHT_RED      4     // ~0.024% (= 2/8191 lama)
+#define LED_BRIGHT_GREEN    4     // ~0.024% (= 2/8191 lama)
 
 // Channel LEDC: 4 dan 6 -> timer berbeda (2 dan 3), jadi freq/resolution
 // masing-masing LED bisa diubah sendiri-sendiri nanti.
@@ -356,18 +356,15 @@ static inline int16_t limiter_softclip(float sample) {
 // === LED STATE MACHINE (Core 0 only, non-blocking) ===
 static wl_status_t last_wifi_status = WL_IDLE_STATUS;
 
-// Brightness 0..255 -> duty 0..LED_PWM_MAX (0 = mati, 255 = duty penuh)
-static inline uint8_t led_duty(uint8_t brightness) {
-    return (uint8_t)((uint32_t)brightness * LED_PWM_MAX / 255u);
-}
-
 // Tulis duty lewat hardware PWM. on=false -> duty 0 (mati, bukan "redup").
+// LED_BRIGHT_* sudah raw duty count, langsung tulis tanpa mapping supaya
+// duty 1 beneran = minimum hardware (mapping 0..255 -> MAX malah naik ke 32).
 static inline void led_red(bool on) {
-    ledcWrite(LED_CH_RED, on ? led_duty(LED_BRIGHT_RED) : 0);
+    ledcWrite(LED_CH_RED, on ? LED_BRIGHT_RED : 0);
 }
 
 static inline void led_green(bool on) {
-    ledcWrite(LED_CH_GREEN, on ? led_duty(LED_BRIGHT_GREEN) : 0);
+    ledcWrite(LED_CH_GREEN, on ? LED_BRIGHT_GREEN : 0);
 }
 
 static void led_pwm_init() {
