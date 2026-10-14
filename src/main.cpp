@@ -32,8 +32,8 @@ extern "C" {
 // Brightness = raw duty count 0..LED_PWM_MAX. 9/16383 = 4.5/8191 (~0.055%),
 // persis tengah antara duty 4 dan 5 di 13-bit. 14-bit butuh freq <=4882Hz
 // (80MHz/16384), makanya freq turun 5k->4kHz. Masih jauh di atas flicker.
-#define LED_BRIGHT_RED      8     // ~0.049% (= 4/8191 lama)
-#define LED_BRIGHT_GREEN    8     // ~0.049% (= 4/8191 lama)
+#define LED_BRIGHT_RED      10     // ~0.049% (= 4/8191 lama)
+#define LED_BRIGHT_GREEN    10     // ~0.049% (= 4/8191 lama)
 
 // Channel LEDC: 4 dan 6 -> timer berbeda (2 dan 3), jadi freq/resolution
 // masing-masing LED bisa diubah sendiri-sendiri nanti.
